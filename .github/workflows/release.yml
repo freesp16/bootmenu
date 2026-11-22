@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  TOOLCHAIN_IMAGE: bootmenu-toolchain:1
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    # The device key lives in this environment's secrets (Settings > Environments > release > BOOTMENU_AES_KEY).
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag, VERSION and changelog agree
+        run: |
+          version=$(cat VERSION)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version"; exit 1; }
+          python3 tools/changelog.py "$version" > release-notes.md
+      - uses: docker/setup-buildx-action@v3
+      - name: Toolchain image
+        uses: docker/build-push-action@v6
+        with:
+          context: toolchain
+          tags: ${{ env.TOOLCHAIN_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=toolchain
+          cache-to: type=gha,mode=max,scope=toolchain
+      - name: Build
+        run: tools/build.sh
+      - name: Test
+        run: |
+          tools/test-arm.sh
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends busybox-static xorriso python3-cryptography
+          tools/test-launcher.sh
+      - name: autoexec.bin
+        env:
+          BOOTMENU_AES_KEY: ${{ secrets.BOOTMENU_AES_KEY }}
+        run: |
+          [ -n "$BOOTMENU_AES_KEY" ] || { echo "::error::the release environment has no BOOTMENU_AES_KEY secret"; exit 1; }
+          python3 tools/build-image.py
+      - name: Package
+        run: |
+          mkdir dist
+          cp out/autoexec.bin dist/autoexec.bin
+          cp out/bootmenu dist/bootmenu-armel
+          (cd dist && sha256sum autoexec.bin bootmenu-armel > SHA256SUMS)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Boot menu $(cat VERSION)" --notes-file release-notes.md --verify-tag

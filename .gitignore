@@ -1,0 +1,9 @@
+build/
+out/
+dist/
+__pycache__/
+*.pyc
+*.iso
+*.ppm
+# never commit a device key
+*.key
