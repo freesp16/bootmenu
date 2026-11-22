@@ -7,13 +7,16 @@
   autoexec.bin        the boot menu
   myapp               a community program (listed as "myapp")
   myapp.ini           optional settings for it (docs/apps.md)
+  other.enc           a program encrypted with the unit's key (docs/apps.md)
+  EP085_Main_R        a copy of the official application, under any name, plain or encrypted (docs/apps.md)
+  EP085_Main_R-gui/   optional screen resources for it, e.g. from a modified update (docs/apps.md)
   apps/other/...      more programs, one folder each
   bootmenu.conf       optional menu settings
   bootmenu.log        written by the menu: what it found, what it started, and any error
 ```
 
 Each row has a label: **INSTALLED · PERSISTENT** for the official software on the unit, **LIVE USB** for programs
-running from the stick, **LAST** for the default.
+running from the stick, **ENCRYPTED** for those encrypted with the unit's key, **LAST** for the default.
 
 The official software is always the first row, with the installed firmware version.
 
@@ -31,7 +34,8 @@ official_wait_ms=8000
 
 - **An app quits:** the menu comes back.
 - **An app fails at once:** the menu comes back and says so; details are in `bootmenu.log`.
-- **The stick is pulled:** the app or the menu stops and the official software starts again.
+- **The stick is pulled:** the app or the menu stops and the official software starts again. What happened then
+  could not be written to the stick, so it is added to `bootmenu.log` the next time the stick goes in.
 - **The screen cannot be used:** the default entry starts without the menu (or the official software).
 
 ## Development images: SSH

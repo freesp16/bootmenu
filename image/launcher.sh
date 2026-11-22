@@ -19,7 +19,7 @@
 #   authorized_keys   public keys allowed to log in as root, optional
 #
 # On the stick (all optional):
-#   <file>, apps/...  apps to list (ARM armel executables; see the README)
+#   <file>, apps/...  apps to list (ARM armel executables, plain or encrypted with the unit's key; see the README)
 #   bootmenu.conf     menu keys (default=, timeout=, scan_root=, show_official=, official_wait_ms=) and network keys:
 #                       ssh=1  ssh_port=22  ssh_ip=169.254.16.16 (none = no alias)  ssh_netmask=255.255.0.0  ssh_dhcp=0
 #                     (without bootmenu.conf, ssh* keys are also read from freesp16.conf, for older sticks)
@@ -28,7 +28,10 @@
 # Written to the stick:
 #   bootmenu.log      this script, the runner, the menu, the SSH server and the apps' output
 #   bootmenu.last     the last choice (the menu's default)
-#   <id>-data/        an app's /root/data (the stick, never NAND)
+#   <id>-data/        an app's /root/data (the stick, never NAND); for the official application run from the stick, a
+#                     copy of the unit's own /root/data made the first time
+# Read from the stick:
+#   <id>-gui/         an app's own screen resources (files for /root/gui), laid over a RAM copy of the unit's
 #
 # Remote control (ssh root@169.254.16.16, then `ctl help`):
 #   ctl status | menu | run ID | start | official | stop | update [ID] < binary | list | log [N] | follow
@@ -54,6 +57,19 @@ LOG="${USB:-/tmp}/bootmenu.log"
     echo "autoexec.sh: a runner is already active (pid $old); not starting another"; exit 0
   fi
 
+  # How the previous session ended after its stick was pulled (that part of the log could only go to RAM).
+  if [ -s "$STAGE/end.log" ]; then
+    echo "--- the end of the previous session, after its stick was removed:"
+    cat "$STAGE/end.log"
+    echo "---"
+  fi
+  rm -f "$STAGE/end.log"
+  rmdir "$STAGE/restore.lock" 2>/dev/null
+  # Bind mounts a runner that died could not undo (each listed once, so never unmounted twice).
+  if [ -f "$STAGE/mounts" ]; then
+    while read -r m; do umount -l "$m" 2>/dev/null && echo "autoexec.sh: left-over mount $m undone"; done < "$STAGE/mounts"
+    rm -f "$STAGE/mounts"
+  fi
   rm -rf "$STAGE/apps" 2>/dev/null
   mkdir -p "$STAGE/bin" "$STAGE/apps" "$STAGE/run" 2>/dev/null
   rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" 2>/dev/null
@@ -267,73 +283,174 @@ stop_ssh() {
 }
 
 # --- Apps' /root/data off NAND -----------------------------------------------------------------------------------------
-# Preferred: a private mount namespace per launch, so only the app sees the swap. Otherwise a global bind mount
+# Preferred: a private mount namespace per launch, so only the app sees the swap. Otherwise global bind mounts
 # while the app runs, undone before the official app comes back.
-if command -v unshare >/dev/null 2>&1 && unshare -m sh -c 'mount -o bind /tmp /root/data' 2>/dev/null; then
+if [ "${BOOTMENU_MOUNT_MODE:-}" = global ]; then
+  MOUNT_MODE=global # as on units without unshare (tools/test-launcher.sh uses it to test that path)
+elif command -v unshare >/dev/null 2>&1 && unshare -m sh -c 'mount -o bind /tmp /root/data' 2>/dev/null; then
   MOUNT_MODE=ns
 else
   MOUNT_MODE=global
 fi
 echo "runner: /root/data redirect: $MOUNT_MODE"
-GLOBAL_MOUNT=""
+# global_bind SRC DST: a bind mount that after_app undoes. The list is a file, so the stick watcher can undo them too.
+global_bind() {
+  mount -o bind "$1" "$2" || return 1
+  echo "$2" >> "$STAGE/mounts"
+}
 
+# Undoes the global bind mounts, each exactly once: whoever renames the list first does it (the runner and the stick
+# watcher may both try). Unmounting /root/data twice would take the unit's own data partition off. Lazily once the
+# stick is gone, so nothing waits on a device that is not there.
 after_app() {
-  if [ -n "$GLOBAL_MOUNT" ]; then
-    umount /root/data 2>/dev/null || umount -l /root/data 2>/dev/null
-    GLOBAL_MOUNT=""
-    echo "runner: /root/data restored"
+  claim="$STAGE/mounts.$$"
+  mv "$STAGE/mounts" "$claim" 2>/dev/null || return 0
+  while read -r m; do
+    if [ -f "$STAGE/gone" ]; then umount -l "$m" 2>/dev/null; else umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null; fi
+    echo "runner: $m restored"
+  done < "$claim"
+  rm -f "$claim"
+}
+
+# After the stick is pulled, the official software is started once, by whichever of the runner and the stick watcher
+# gets there first.
+restore_once() {
+  mkdir "$STAGE/restore.lock" 2>/dev/null || return 0
+  restore_official
+}
+
+now_s() { cut -d' ' -f1 /proc/uptime; }
+
+# Stick apps run from a RAM disk of their own: the unit's /tmp is small (often under 10 MB free, less than the official
+# application's 12 MB) but its RAM is not, and a program must not depend on the stick while it runs (the official
+# application handles USB storage itself). Without the RAM disk, /tmp is used as before.
+RUN_RAM_SIZE=128m
+run_ramdisk() {
+  grep -q " $STAGE/run tmpfs " /proc/mounts 2>/dev/null && return 0
+  mkdir -p "$STAGE/run"
+  if mount -t tmpfs -o size=$RUN_RAM_SIZE,mode=0755 tmpfs "$STAGE/run" 2>/dev/null; then
+    echo "runner: RAM disk for apps: $STAGE/run ($RUN_RAM_SIZE)"
+  else
+    echo "runner: WARNING no RAM disk for apps; they are copied to /tmp when it has room"
   fi
 }
 
-# The executable to run: stick apps are copied to RAM (cached by size + time) unless run_from=stick or /tmp is full.
+# The executable to run: stick apps are copied to RAM (cached by size + time, one app at a time) unless run_from=stick
+# or there is no room; encrypted ones are decrypted there (bootmenu --decrypt, with the unit's key), else on the stick.
 app_binary() {
   APP_EXE="$BM_EXE"
   [ "$BM_SOURCE" = stick ] || return 0
-  [ "$BM_RUN_FROM" = stick ] && return 0
+  [ "$BM_RUN_FROM" = stick ] && [ "$BM_ENCRYPTED" != 1 ] && return 0
+  run_ramdisk
   cache="$STAGE/run/$BM_ID.bin"
   stamp="$BM_SIZE $BM_MTIME"
   if [ -x "$cache" ] && [ "$(cat "$cache.stamp" 2>/dev/null)" = "$stamp" ]; then
     APP_EXE="$cache"; echo "runner: $BM_ID: RAM copy is current"; return 0
   fi
-  rm -f "$cache" "$cache.stamp" "$cache.tmp"
+  for f in "$STAGE"/run/*.bin; do [ -e "$f" ] && rm -f "$f" "$f.stamp"; done
+  rm -f "$cache.tmp"
+  if [ "$BM_ENCRYPTED" = 1 ]; then
+    for cache in "$cache" "$USB_RUN/bootmenu-cache/$BM_ID.bin"; do
+      mkdir -p "$(dirname "$cache")" 2>/dev/null
+      if "$STAGE/bin/bootmenu" --decrypt "$BM_EXE" > "$cache.tmp" && mv "$cache.tmp" "$cache"; then
+        chmod 0755 "$cache"; echo "$stamp" > "$cache.stamp"
+        APP_EXE="$cache"; echo "runner: $BM_ID: decrypted to $cache"; return 0
+      fi
+      rm -f "$cache.tmp"
+      echo "runner: $BM_ID: could not decrypt to $cache"
+    done
+    APP_EXE=""; return 1
+  fi
   if cp "$BM_EXE" "$cache.tmp" 2>/dev/null && mv "$cache.tmp" "$cache"; then
     chmod 0755 "$cache"; echo "$stamp" > "$cache.stamp"
     APP_EXE="$cache"; echo "runner: $BM_ID: copied to RAM ($BM_SIZE bytes)"
   else
     rm -f "$cache.tmp"
-    echo "runner: $BM_ID: no room in /tmp, running it from the stick"
+    echo "runner: $BM_ID: no room in RAM, running it from the stick"
   fi
+}
+
+# An app's own screen resources (<id>-gui/ on the stick, BM_GUI): the unit's /root/gui with the app's files laid over
+# it, in the RAM disk, so a folder may hold only what differs (e.g. a modified official application's new images).
+# Bound over /root/gui while the app runs; the unit's /root/gui is never written. Kept while the folder is unchanged.
+prepare_gui() {
+  APP_GUI=""
+  gui_dst="$STAGE/run/gui"
+  if [ -z "$BM_GUI" ] || [ ! -d "$BM_GUI" ]; then rm -rf "$gui_dst"; return 0; fi
+  run_ramdisk
+  gui_stamp=""
+  command -v cksum >/dev/null 2>&1 && gui_stamp="$BM_GUI $(ls -lR "$BM_GUI" 2>/dev/null | cksum)"
+  if [ -n "$gui_stamp" ] && [ -d "$gui_dst/root" ] && [ "$(cat "$gui_dst/.stamp" 2>/dev/null)" = "$gui_stamp" ]; then
+    APP_GUI="$gui_dst/root"; echo "runner: $BM_ID: screen resources in RAM are current"; return 0
+  fi
+  rm -rf "$gui_dst"
+  gui_t0=$(cut -d' ' -f1 /proc/uptime)
+  if mkdir -p "$gui_dst/root" && cp -R /root/gui/. "$gui_dst/root/" 2>/dev/null && cp -R "$BM_GUI/." "$gui_dst/root/"; then
+    echo "$gui_stamp" > "$gui_dst/.stamp"
+    APP_GUI="$gui_dst/root"
+    echo "runner: $BM_ID: screen resources: the unit's with $(find "$BM_GUI" -type f | wc -l) file(s) of $BM_GUI over" \
+      "them, in RAM ($(awk -v a="$gui_t0" '{ printf "%.1f", $1 - a }' /proc/uptime) s)"
+  else
+    rm -rf "$gui_dst"
+    APP_GUI="$BM_GUI"
+    echo "runner: $BM_ID: WARNING no room in RAM for the screen resources; $BM_GUI is used as it is (complete only if it holds every file)"
+  fi
+}
+
+# The official application from the stick starts with a copy of the unit's settings (calibration, last state), kept in
+# its own folder on the stick, so the installed software's settings never change.
+seed_official_data() {
+  [ -f "$1/.bootmenu-seeded" ] && return 0
+  if cp -R /root/data/. "$1/" 2>/dev/null; then echo "runner: $BM_ID: settings copied from the unit's /root/data"
+  else echo "runner: $BM_ID: WARNING not all of /root/data could be copied to $1"; fi
+  touch "$1/.bootmenu-seeded"
 }
 
 # Starts the chosen app (choice.sh is sourced) in the background; APP_PID = its pid.
 launch_app() {
-  app_binary
+  app_binary || { echo "runner: ERROR $BM_ID could not be decrypted (no key on this unit, or no room)"; return 1; }
+  prepare_gui
   stop_official
   log_holders "before launching $BM_ID"
   DATA=""
   if [ "$BM_DATA" != none ] && [ -n "$BM_DATA" ]; then
     DATA="$USB_RUN/$BM_DATA"
-    if ! mkdir -p "$DATA/$BM_ID" 2>/dev/null; then
-      DATA="$STAGE/data/$BM_ID"; mkdir -p "$DATA/$BM_ID"
+    # the official application keeps its files straight in /root/data; other apps in /root/data/<id>
+    sub="/$BM_ID"; [ "$BM_OFFICIAL_BUILD" = 1 ] && sub=""
+    if ! mkdir -p "$DATA$sub" 2>/dev/null; then
+      DATA="$STAGE/data/$BM_ID"; mkdir -p "$DATA$sub"
       echo "runner: WARNING could not create $USB_RUN/$BM_DATA, using RAM ($DATA); data is lost on exit"
     fi
+    [ "$BM_OFFICIAL_BUILD" = 1 ] && seed_official_data "$DATA"
   fi
-  if [ -n "$DATA" ] && [ "$MOUNT_MODE" = global ]; then
-    if mount -o bind "$DATA" /root/data; then GLOBAL_MOUNT=1
-    elif mount -t tmpfs -o size=16m tmpfs /root/data; then
-      GLOBAL_MOUNT=1; echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
-    else
-      echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
+  if [ "$MOUNT_MODE" = global ]; then
+    if [ -n "$DATA" ] && ! global_bind "$DATA" /root/data; then
+      if mount -t tmpfs -o size=16m tmpfs /root/data; then
+        echo /root/data >> "$STAGE/mounts"
+        echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
+      else
+        echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
+      fi
+    fi
+    if [ -n "$APP_GUI" ] && ! global_bind "$APP_GUI" /root/gui; then
+      echo "runner: WARNING could not mount its screen resources; $BM_ID uses the unit's"
     fi
   fi
-  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}, $MOUNT_MODE)"
+  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}${APP_GUI:+, /root/gui = $APP_GUI}, $MOUNT_MODE)"
   (
     cd "$BM_DIR" 2>/dev/null || cd /tmp
     [ -n "$BM_CONF" ] && read_conf "$USB_RUN/$BM_CONF" "$BM_PREFIX" && echo "runner: $BM_CONF -> ${BM_PREFIX}*"
     export HOME="${DATA:-$STAGE}" BOOTMENU_STICK="$USB_RUN" BOOTMENU_APP_DIR="$BM_DIR" BOOTMENU_APP_ID="$BM_ID"
-    if [ -n "$DATA" ] && [ "$MOUNT_MODE" = ns ]; then
-      # shellcheck disable=SC2086
-      exec unshare -m sh -c 'mount -o bind "$1" /root/data || exit 97; shift; exec "$@"' sh "$DATA" "$APP_EXE" $BM_ARGS
+    if [ "$MOUNT_MODE" = ns ]; then
+      # the bind mounts as SRC DST pairs, then --, then the command: made in the app's own mount namespace
+      set --
+      [ -n "$DATA" ] && set -- "$@" "$DATA" /root/data
+      [ -n "$APP_GUI" ] && set -- "$@" "$APP_GUI" /root/gui
+      if [ $# -gt 0 ]; then
+        # shellcheck disable=SC2086
+        exec unshare -m sh -c 'while [ "$1" != -- ]; do mount -o bind "$1" "$2" || exit 97; shift 2; done; shift
+          exec "$@"' sh "$@" -- "$APP_EXE" $BM_ARGS
+      fi
     fi
     # shellcheck disable=SC2086
     exec "$APP_EXE" $BM_ARGS
@@ -371,7 +488,7 @@ run_menu() {
 
 load_choice() {
   BM_KIND=""; BM_ID=""; BM_NAME=""; BM_SOURCE=""; BM_EXE=""; BM_DIR=""; BM_ARGS=""; BM_DATA=""; BM_CONF=""
-  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""
+  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""; BM_ENCRYPTED=""; BM_OFFICIAL_BUILD=""; BM_GUI=""
   . "$STAGE/choice.sh"
 }
 
@@ -390,10 +507,28 @@ echo "runner: watching stick device ${DEV:-unknown}"
   tick=0
   while [ ! -f "$STAGE/runner.done" ]; do
     if { [ -n "$DEV" ] && [ ! -b "$DEV" ]; } || { [ -n "$DEV" ] && ! grep -q " $USB_RUN " /proc/mounts; }; then
-      echo "runner: stick removed, ending the session"
+      # The session ends here, whatever the runner is doing: stop the app or menu, undo the mounts, start the official
+      # software. The log goes to RAM (shown in bootmenu.log at the next insertion).
       touch "$STAGE/gone"
+      exec >>"$STAGE/end.log" 2>&1
+      echo "watcher: $(now_s) s: stick removed ($DEV), ending the session"
       p=$(cat "$STAGE/child.pid" 2>/dev/null)
-      if [ -n "$p" ]; then kill -TERM "$p" 2>/dev/null; sleep 3; kill -KILL "$p" 2>/dev/null; fi
+      if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        echo "watcher: stopping pid $p ($(cat "/proc/$p/comm" 2>/dev/null))"
+        kill -TERM "$p" 2>/dev/null
+        i=0; while kill -0 "$p" 2>/dev/null && [ $i -lt 3 ]; do sleep 1; i=$((i+1)); done
+        kill -KILL "$p" 2>/dev/null
+        i=0; while kill -0 "$p" 2>/dev/null && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done
+        if kill -0 "$p" 2>/dev/null; then
+          echo "watcher: pid $p is still there (state $(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null), wchan $(cat "/proc/$p/wchan" 2>/dev/null))"
+        else
+          echo "watcher: pid $p ended"
+        fi
+      fi
+      after_app
+      log_holders "before the official software comes back"
+      restore_once && echo "watcher: $(now_s) s: official software started (or already running)"
+      echo "watcher: done"
       exit 0
     fi
     tick=$((tick+1))
@@ -404,6 +539,7 @@ echo "runner: watching stick device ${DEV:-unknown}"
     sleep 1
   done
 ) &
+WATCHER_PID=$!
 
 # --- Supervisor --------------------------------------------------------------------------------------------------------
 # NEXT: menu (show it), run (resolve RUN_SPEC without the menu), app (run choice.sh), official, idle (wait for ctl).
@@ -473,8 +609,10 @@ while :; do
 done
 
 touch "$STAGE/runner.done"
+[ -f "$STAGE/gone" ] && exec >>"$STAGE/end.log" 2>&1 && echo "runner: $(now_s) s: the stick is gone"
 after_app
-restore_official   # first: the unit is usable again at once
+if [ -f "$STAGE/gone" ]; then restore_once; else restore_official; fi   # first: the unit is usable again at once
+[ -f "$STAGE/gone" ] && wait "$WATCHER_PID" 2>/dev/null   # its recovery steps end up in the log before this one
 stop_ssh
 rm -f "$STAGE/runner.pid" "$STAGE/state"
 echo "runner: session over"
