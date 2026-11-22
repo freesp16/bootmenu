@@ -8,8 +8,9 @@ All notable changes to this project are listed here. The format follows
 
 ### Added
 - Official firmware updates (`.UPD`) on the stick are listed with their version, labelled *(live usb)*, and run
-  live without being installed: the update's `EP085_Main_R` and GUI resources are decrypted out of it into RAM with
-  the unit's own key, and its settings are kept on the stick (a copy of the unit's, made once).
+  live without being installed: the update's `EP085_Main_R` and GUI resources are decrypted out of it with the
+  unit's own key into a RAM disk of their own (the unit's `/tmp` is too small), and its settings are kept on the
+  stick (a copy of the unit's, made once; in RAM while it runs, saved back every 10 s).
 - `bootmenu --upd FILE --extract PATH`: decrypts one file of an update's image (only the sectors it covers).
 
 ## [1.0.0] - 2026-11-22

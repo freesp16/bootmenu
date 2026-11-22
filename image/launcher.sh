@@ -287,6 +287,8 @@ global_bind() {
 }
 
 after_app() {
+  save_firmware_data
+  FW_DATA_STICK=""
   for m in $GLOBAL_MOUNTS; do
     umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
     echo "runner: $m restored"
@@ -297,11 +299,27 @@ after_app() {
 # --- Official firmware from an update file on the stick, run live --------------------------------------------------------
 # The menu decrypts single files of the update's image with the unit's own key (bootmenu --upd FILE --extract PATH);
 # gzip and tar then unpack only what is needed: pdj/EP085_Main_R and pdj/app.rev (images/pdj.tar.gz) and the release's
-# GUI resources, root/gui (in one of the rootfs*.tar.gz). About 21 MB: RAM when there is room, else the stick. Kept for
-# the session (keyed by the file's size and time), one release at a time. The update's own updater never runs.
+# GUI resources, root/gui (in one of the rootfs*.tar.gz). About 21 MB, in a RAM disk of its own: the unit's /tmp is
+# small (under 10 MB free is common) but its RAM is not, and the firmware must not depend on the stick it manages
+# itself (its USB storage handling). Only without that RAM disk: /tmp when it has room, else the stick. Kept for the
+# session (keyed by the file's size and time), one release at a time. The update's own updater never runs.
 FW_RAM="$STAGE/fw"
+FW_RAM_SIZE=96m
 FW_STICK="$USB_RUN/bootmenu-cache/fw"
 FW_NEED_KB=32768
+FW_DATA_STICK=""
+
+fw_ramdisk_mounted() { grep -q " $FW_RAM tmpfs " /proc/mounts 2>/dev/null; }
+
+# The RAM disk for the unpacked firmware (and its settings while it runs); 1 when it could not be made.
+fw_ramdisk() {
+  fw_ramdisk_mounted && return 0
+  mkdir -p "$FW_RAM" 2>/dev/null || return 1
+  if mount -t tmpfs -o size=$FW_RAM_SIZE,mode=0755 tmpfs "$FW_RAM" 2>/dev/null; then
+    echo "runner: RAM disk for the firmware: $FW_RAM ($FW_RAM_SIZE)"; return 0
+  fi
+  echo "runner: WARNING could not make a RAM disk for the firmware"; return 1
+}
 
 # upd_unpack UPD MEMBER DEST [tar names...]: DEST/.err lists what failed ("bootmenu": no such member or it could not
 # be decrypted; "gzip": the stream broke, e.g. tar could not write). tar's own status is ignored: names it does not
@@ -326,16 +344,22 @@ firmware_paths() {
 prepare_firmware() {
   FW_GUI=""; FW_REV=""
   fw_stamp="$BM_SIZE $BM_MTIME"
+  fw_ram_ok=""
+  fw_ramdisk && fw_ram_ok=1
   for FW in "$FW_RAM/$BM_ID" "$FW_STICK/$BM_ID"; do
+    # a copy on the stick only when there is no RAM disk (it is then replaced by one in RAM)
+    case "$FW" in "$FW_STICK"/*) [ -n "$fw_ram_ok" ] && continue;; esac
     if [ -x "$FW/pdj/EP085_Main_R" ] && [ "$(cat "$FW/.stamp" 2>/dev/null)" = "$fw_stamp" ]; then
       echo "runner: $BM_ID: unpacked copy is current ($FW)"; firmware_paths; return 0
     fi
   done
-  rm -rf "$FW_RAM" "$FW_STICK"
-  fw_free=$(df -k /tmp 2>/dev/null | awk 'NR == 2 { print $4 }')
+  rm -rf "$FW_RAM"/* "$FW_STICK" 2>/dev/null
   fw_low=""
-  if [ -n "$fw_free" ] && [ "$fw_free" -lt $FW_NEED_KB ]; then
-    echo "runner: $BM_ID: only $fw_free KB free in /tmp, unpacking to the stick"; fw_low=1
+  if [ -z "$fw_ram_ok" ]; then
+    fw_free=$(df -k /tmp 2>/dev/null | awk 'NR == 2 { print $4 }')
+    if [ -n "$fw_free" ] && [ "$fw_free" -lt $FW_NEED_KB ]; then
+      echo "runner: $BM_ID: only $fw_free KB free in /tmp, unpacking to the stick"; fw_low=1
+    fi
   fi
   for fw_where in ram stick; do
     if [ "$fw_where" = ram ]; then [ -n "$fw_low" ] && continue; fw_base=$FW_RAM; else fw_base=$FW_STICK; fi
@@ -364,7 +388,31 @@ prepare_firmware() {
   return 1
 }
 
-free_firmware() { [ -d "$FW_RAM" ] && rm -rf "$FW_RAM" && echo "runner: unpacked firmware removed from RAM"; }
+free_firmware() {
+  [ -d "$FW_RAM" ] || return 0
+  save_firmware_data
+  if fw_ramdisk_mounted; then umount "$FW_RAM" 2>/dev/null || umount -l "$FW_RAM" 2>/dev/null; fi
+  rm -rf "$FW_RAM" && echo "runner: unpacked firmware removed from RAM"
+}
+
+# While the firmware runs from RAM, so do its settings; they are saved back to the stick every 10 s and when it ends.
+save_firmware_data() {
+  [ -n "$FW_DATA_STICK" ] && [ -d "$FW/data" ] || return 0
+  cp -R "$FW/data/." "$FW_DATA_STICK/" 2>/dev/null || echo "runner: $BM_ID: WARNING could not save its settings to $FW_DATA_STICK"
+}
+
+# What the live firmware is doing (its output is block-buffered, so the log alone cannot tell where it waits):
+# process state, kernel wait channel, threads blocked in the kernel (D) and the stick's mount.
+firmware_state() {
+  [ -d "/proc/$1" ] || return 0
+  blocked=""
+  for t in /proc/"$1"/task/*; do
+    [ "$(cut -d' ' -f3 "$t/stat" 2>/dev/null)" = D ] && blocked="$blocked ${t##*/}:$(cat "$t/wchan" 2>/dev/null)"
+  done
+  echo "runner: $BM_ID after $2 s: state $(cut -d' ' -f3 "/proc/$1/stat" 2>/dev/null) wchan $(cat "/proc/$1/wchan" 2>/dev/null)," \
+    "$(ls "/proc/$1/task" 2>/dev/null | wc -l) threads, $(awk '/^VmRSS/ { print $2 " kB" }' "/proc/$1/status" 2>/dev/null)," \
+    "blocked:${blocked:- none}, stick $(grep -q " $USB_RUN " /proc/mounts && echo mounted || echo NOT MOUNTED)"
+}
 
 # The live firmware keeps its settings on the stick; the first time they are a copy of the unit's own (calibration,
 # last state), so it starts as the installed one would.
@@ -397,7 +445,7 @@ app_binary() {
 
 # Starts the chosen app (choice.sh is sourced) in the background; APP_PID = its pid.
 launch_app() {
-  FW_GUI=""; FW_REV=""
+  FW_GUI=""; FW_REV=""; FW_DATA_STICK=""
   if [ "$BM_KIND" = firmware ]; then
     prepare_firmware || { echo "runner: ERROR could not unpack $BM_EXE; not starting $BM_ID"; return 1; }
   else
@@ -417,7 +465,15 @@ launch_app() {
       mkdir -p "$data_dir"
       echo "runner: WARNING could not create $USB_RUN/$BM_DATA, using RAM ($DATA); data is lost on exit"
     fi
-    [ "$BM_KIND" = firmware ] && seed_firmware_data "$DATA"
+    if [ "$BM_KIND" = firmware ]; then
+      seed_firmware_data "$DATA"
+      case "$FW" in "$FW_RAM"/*)
+        # unpacked to RAM: the settings too, from the stick copy (saved back by save_firmware_data)
+        rm -rf "$FW/data" && mkdir -p "$FW/data" && cp -R "$DATA/." "$FW/data/" 2>/dev/null \
+          && FW_DATA_STICK=$DATA && DATA="$FW/data" \
+          || echo "runner: $BM_ID: WARNING settings stay on the stick ($DATA)";;
+      esac
+    fi
   fi
   if [ "$MOUNT_MODE" = global ]; then
     if [ -n "$DATA" ] && ! global_bind "$DATA" /root/data; then
@@ -454,6 +510,17 @@ launch_app() {
     exec "$APP_EXE" $BM_ARGS
   ) </dev/null &
   APP_PID=$!
+  if [ "$BM_KIND" = firmware ]; then
+    ( fw_pid=$APP_PID; fw_s=0
+      for fw_at in 5 15 30 60; do
+        sleep $((fw_at - fw_s)); fw_s=$fw_at
+        kill -0 "$fw_pid" 2>/dev/null || exit 0
+        firmware_state "$fw_pid" "$fw_at"
+      done ) &
+    if [ -n "$FW_DATA_STICK" ]; then
+      ( while kill -0 "$APP_PID" 2>/dev/null; do sleep 10; save_firmware_data; done ) &
+    fi
+  fi
   return 0
 }
 

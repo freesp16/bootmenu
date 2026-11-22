@@ -133,10 +133,11 @@ wait_for "FAKEFW" $L 30
 # while it runs: start it again (the unpacked copy is reused), then let it end
 sh $CTL run firmware-9.99
 wait_for "runner: firmware-9.99 exited rc=0" $L 30
+check "the firmware gets a RAM disk of its own" "RAM disk for the firmware: /tmp/bootmenu/fw" $L
 check "the update's EP085_Main_R was unpacked to RAM" "firmware-9.99: unpacked to /tmp/bootmenu/fw/firmware-9.99" $L
 check "it runs in /root/pdj with the update's GUI resources and app.rev" "FAKEFW cwd=/root/pdj gui=update 9.99 rev=Rev.9999" $L
 check "it starts with a copy of the unit's settings" "FAKEFW .* dat=unit settings" $L
-[ -f $S/firmware-9.99-data/written-by-fw ] && echo "PASS the live firmware writes its settings to the stick" \
+[ -f $S/firmware-9.99-data/written-by-fw ] && echo "PASS the live firmware's settings are saved to the stick" \
   || { echo "FAIL no $S/firmware-9.99-data/written-by-fw"; fail=1; }
 [ -f /root/data/written-by-fw ] && { echo "FAIL the live firmware wrote to the unit's /root/data"; fail=1; } \
   || echo "PASS nothing written to the unit's /root/data"
@@ -144,6 +145,7 @@ check "it starts with a copy of the unit's settings" "FAKEFW .* dat=unit setting
   && echo "PASS the unit's GUI resources and app.rev are untouched" || { echo "FAIL the unit's files changed"; fail=1; }
 check "a second start reuses the unpacked copy" "firmware-9.99: unpacked copy is current" $L
 wait_for "unpacked firmware removed from RAM" $L 15
+grep -q " /tmp/bootmenu/fw " /proc/mounts && { echo "FAIL the firmware RAM disk is still mounted"; fail=1; }
 [ ! -d /tmp/bootmenu/fw ] && echo "PASS the unpacked firmware leaves RAM with the official software" \
   || { echo "FAIL /tmp/bootmenu/fw is still there"; fail=1; }
 

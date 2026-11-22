@@ -26,20 +26,24 @@ version is read from the file itself, and the row says whether it is the same as
 files can sit side by side (one per version, the file name does not matter).
 
 Starting it does **not** update the unit. The menu decrypts only the official application and its screen resources
-out of the update file, with the unit's own key, into RAM (about 21 MB; on the stick in `bootmenu-cache/` when RAM is
-short), and runs them in place of the installed software. The update's installer never runs and nothing is written
+out of the update file, with the unit's own key, into a RAM disk of their own (about 21 MB; the unit's `/tmp` is too
+small, its RAM is not), and runs them in place of the installed software, so the firmware never runs off the stick it
+manages itself. Only if that RAM disk cannot be made do they go to `/tmp` or, as a last resort, the stick
+(`bootmenu-cache/`). The update's installer never runs and nothing is written
 to the unit's internal memory:
 
 - the update's `EP085_Main_R` runs from `/root/pdj` with the unit's libraries, its own GUI resources and its own
   revision (`app.rev`);
-- its settings (`/root/data`) are on the stick in `firmware-<version>-data/`, a copy of the unit's own made the first
-  time (calibration, preferences), so the installed firmware's settings never change;
+- its settings (`/root/data`) are kept on the stick in `firmware-<version>-data/`, a copy of the unit's own made the
+  first time (calibration, preferences), so the installed firmware's settings never change. While it runs they are in
+  RAM too and saved back to the stick every 10 seconds and when it ends;
 - your projects and samples are the usual ones (the unit's internal storage and the stick), as with the installed
   software. A newer firmware may save projects in a format an older installed one cannot open: keep a copy before
   saving over a project with a different version.
 
 When it quits, the menu comes back; pulling the stick brings back the installed software. The first start takes a few
-seconds more (unpacking); later starts in the same session reuse the unpacked copy.
+seconds more (unpacking); later starts in the same session reuse the unpacked copy. `bootmenu.log` records what the
+firmware is doing 5, 15, 30 and 60 seconds after it starts (process state, and any thread blocked in the kernel).
 
 A `TORAIZSP16.ini` beside the update file (same name, `.ini`) accepts `name=`, `description=`, `hidden=1`, `accent=`
 and `data=` (`data=none` runs it with the unit's own `/root/data` instead of a copy on the stick).
