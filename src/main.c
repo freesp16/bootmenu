@@ -3,6 +3,7 @@
  *   bootmenu --stick DIR [--embedded DIR] [--out FILE] [--render fb|x11|host] [--fallback] [--message TEXT]
  *   bootmenu --stick DIR [--embedded DIR] --resolve SPEC|default [--out FILE]    (no screen: write a choice)
  *   bootmenu --stick DIR [--embedded DIR] --list
+ *   bootmenu --decrypt FILE [--key KEYFILE]           (an encrypted program, decrypted, on stdout)
  *
  * Start-up order (every step logged with its time, "BOOTMENU <ms> ..."):
  *   1. SIGTERM to the official app            it shuts down while we do 2 and 3
@@ -15,7 +16,8 @@
  *
  * Exit codes: 0 a choice was written to --out; 2 graphics failed (the launcher runs us again with --render x11
  * --fallback); 3 graphics failed and --fallback wrote the default (or official) choice; 4 nothing could be chosen;
- * 5 stopped by a signal or q (no choice); 6 the stick was pulled (the launcher starts the official app at once); 1 usage. */
+ * 5 stopped by a signal or q (no choice); 6 the stick was pulled (the launcher starts the official app at once); 1 usage;
+ * 7 --decrypt failed. --key: the unit's key file for encrypted programs (default BM_KEY). */
 #define _GNU_SOURCE
 #include "bm.h"
 
@@ -94,12 +96,13 @@ static void usage(void) {
             "                [--screenshot FILE.ppm] [--exit-after FRAMES] [--keys KEYS]\n"
             "       bootmenu --stick DIR [--embedded DIR] --resolve SPEC|default [--out FILE]\n"
             "       bootmenu --stick DIR [--embedded DIR] --list\n"
+            "       bootmenu --decrypt FILE [--key KEYFILE]\n"
             "       bootmenu --version\n");
 }
 
 typedef struct {
     Config cfg;
-    const char *conf, *out, *render, *message, *resolve, *shot, *keys;
+    const char *conf, *out, *render, *message, *resolve, *shot, *keys, *decrypt;
     int fallback, list, no_official_stop, exit_after;
 } Args;
 
@@ -120,6 +123,8 @@ static int parse(Args *a, int argc, char **argv) {
         if (!strcmp(k, "--resolve")) { VAL(a->resolve) }
         if (!strcmp(k, "--screenshot")) { VAL(a->shot) }
         if (!strcmp(k, "--keys")) { VAL(a->keys) }
+        if (!strcmp(k, "--decrypt")) { VAL(a->decrypt) }
+        if (!strcmp(k, "--key")) { if (!v) return -1; snprintf(a->cfg.key, sizeof a->cfg.key, "%s", v); i++; continue; }
         if (!strcmp(k, "--exit-after")) { if (!v) return -1; a->exit_after = atoi(v); i++; continue; }
         if (!strcmp(k, "--fallback")) { a->fallback = 1; continue; }
         if (!strcmp(k, "--list")) { a->list = 1; continue; }
@@ -178,6 +183,11 @@ int main(int argc, char **argv) {
     if (parse(&a, argc, argv) != 0) {
         usage();
         return 1;
+    }
+    /* An encrypted program, decrypted to stdout: the launcher writes it to RAM and runs it. */
+    if (a.decrypt) {
+        if (!crypt_key_load(a.cfg.key)) return 7;
+        return crypt_decrypt_file(a.decrypt, STDOUT_FILENO) == 0 ? 0 : 7;
     }
     char conf[320];
     if (a.conf) snprintf(conf, sizeof conf, "%s", a.conf);

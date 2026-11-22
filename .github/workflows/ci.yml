@@ -47,15 +47,14 @@ jobs:
           cache-to: type=gha,mode=max,scope=toolchain
       - name: Build
         run: tools/build.sh
+      - name: Test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends busybox-static xorriso python3-cryptography
       - name: Test the ARM build under qemu
         run: tools/test-arm.sh
       - name: Test the launcher scripts
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends busybox-static
-          tools/test-launcher.sh
+        run: tools/test-launcher.sh
       - name: Package an image with a throwaway key (layout check only)
         run: |
-          sudo apt-get install -y --no-install-recommends xorriso python3-cryptography
           BOOTMENU_AES_KEY=ci-throwaway-key-not-for-any-unit python3 tools/build-image.py --out out/autoexec-testkey.bin
       - uses: actions/upload-artifact@v4
         with:

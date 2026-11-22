@@ -312,6 +312,7 @@ void menu_draw(Menu *m) {
         uint32_t chip_rgb;
         const char *where = source_chip(a, &chip_rgb);
         cx -= chip(cx, y + ROW_H / 2.0f, where, chip_rgb, al, 1) + 6;
+        if (a->encrypted) cx -= chip(cx, y + ROW_H / 2.0f, "ENCRYPTED", CHIP_NEUTRAL, al, 0) + 6;
         if (a->source == m->def_source && !strcmp(a->id, m->def_id))
             cx -= chip(cx, y + ROW_H / 2.0f, m->def_label, CHIP_NEUTRAL, al, 0) + 6;
         gfx_text_fit(FONT_NAME, tx, y + 32, rgba(is_sel ? 0xffffff : 0xdfe4ec, (unsigned)(255 * al)), a->name, cx - tx - 12);

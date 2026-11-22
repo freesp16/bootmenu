@@ -6,6 +6,17 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Programs encrypted with the unit's key (the cipher of `autoexec.bin`) are listed under their file name with an
+  ENCRYPTED label and decrypted into RAM when started; `tools/encrypt-app.py` makes them, `bootmenu --decrypt`
+  decrypts one.
+- The official application (`EP085_Main_R`) on the stick, plain or encrypted and under any file name, is recognised
+  by its content and runs as the installed one does (in `/root/pdj`), with a copy of the unit's settings on the stick.
+
+### Changed
+- Programs from the stick run from a RAM disk of their own instead of `/tmp`, which is too small on the unit for
+  larger programs (they ran from the stick instead).
+
 ## [1.0.0] - 2026-11-22
 
 First public release.

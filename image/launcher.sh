@@ -19,7 +19,7 @@
 #   authorized_keys   public keys allowed to log in as root, optional
 #
 # On the stick (all optional):
-#   <file>, apps/...  apps to list (ARM armel executables; see the README)
+#   <file>, apps/...  apps to list (ARM armel executables, plain or encrypted with the unit's key; see the README)
 #   bootmenu.conf     menu keys (default=, timeout=, scan_root=, show_official=, official_wait_ms=) and network keys:
 #                       ssh=1  ssh_port=22  ssh_ip=169.254.16.16 (none = no alias)  ssh_netmask=255.255.0.0  ssh_dhcp=0
 #                     (without bootmenu.conf, ssh* keys are also read from freesp16.conf, for older sticks)
@@ -28,7 +28,8 @@
 # Written to the stick:
 #   bootmenu.log      this script, the runner, the menu, the SSH server and the apps' output
 #   bootmenu.last     the last choice (the menu's default)
-#   <id>-data/        an app's /root/data (the stick, never NAND)
+#   <id>-data/        an app's /root/data (the stick, never NAND); for the official application run from the stick, a
+#                     copy of the unit's own /root/data made the first time
 #
 # Remote control (ssh root@169.254.16.16, then `ctl help`):
 #   ctl status | menu | run ID | start | official | stop | update [ID] < binary | list | log [N] | follow
@@ -285,38 +286,79 @@ after_app() {
   fi
 }
 
-# The executable to run: stick apps are copied to RAM (cached by size + time) unless run_from=stick or /tmp is full.
+# Stick apps run from a RAM disk of their own: the unit's /tmp is small (often under 10 MB free, less than the official
+# application's 12 MB) but its RAM is not, and a program must not depend on the stick while it runs (the official
+# application handles USB storage itself). Without the RAM disk, /tmp is used as before.
+RUN_RAM_SIZE=128m
+run_ramdisk() {
+  grep -q " $STAGE/run tmpfs " /proc/mounts 2>/dev/null && return 0
+  mkdir -p "$STAGE/run"
+  if mount -t tmpfs -o size=$RUN_RAM_SIZE,mode=0755 tmpfs "$STAGE/run" 2>/dev/null; then
+    echo "runner: RAM disk for apps: $STAGE/run ($RUN_RAM_SIZE)"
+  else
+    echo "runner: WARNING no RAM disk for apps; they are copied to /tmp when it has room"
+  fi
+}
+
+# The executable to run: stick apps are copied to RAM (cached by size + time, one app at a time) unless run_from=stick
+# or there is no room; encrypted ones are decrypted there (bootmenu --decrypt, with the unit's key), else on the stick.
 app_binary() {
   APP_EXE="$BM_EXE"
   [ "$BM_SOURCE" = stick ] || return 0
-  [ "$BM_RUN_FROM" = stick ] && return 0
+  [ "$BM_RUN_FROM" = stick ] && [ "$BM_ENCRYPTED" != 1 ] && return 0
+  run_ramdisk
   cache="$STAGE/run/$BM_ID.bin"
   stamp="$BM_SIZE $BM_MTIME"
   if [ -x "$cache" ] && [ "$(cat "$cache.stamp" 2>/dev/null)" = "$stamp" ]; then
     APP_EXE="$cache"; echo "runner: $BM_ID: RAM copy is current"; return 0
   fi
-  rm -f "$cache" "$cache.stamp" "$cache.tmp"
+  for f in "$STAGE"/run/*.bin; do [ -e "$f" ] && rm -f "$f" "$f.stamp"; done
+  rm -f "$cache.tmp"
+  if [ "$BM_ENCRYPTED" = 1 ]; then
+    for cache in "$cache" "$USB_RUN/bootmenu-cache/$BM_ID.bin"; do
+      mkdir -p "$(dirname "$cache")" 2>/dev/null
+      if "$STAGE/bin/bootmenu" --decrypt "$BM_EXE" > "$cache.tmp" && mv "$cache.tmp" "$cache"; then
+        chmod 0755 "$cache"; echo "$stamp" > "$cache.stamp"
+        APP_EXE="$cache"; echo "runner: $BM_ID: decrypted to $cache"; return 0
+      fi
+      rm -f "$cache.tmp"
+      echo "runner: $BM_ID: could not decrypt to $cache"
+    done
+    APP_EXE=""; return 1
+  fi
   if cp "$BM_EXE" "$cache.tmp" 2>/dev/null && mv "$cache.tmp" "$cache"; then
     chmod 0755 "$cache"; echo "$stamp" > "$cache.stamp"
     APP_EXE="$cache"; echo "runner: $BM_ID: copied to RAM ($BM_SIZE bytes)"
   else
     rm -f "$cache.tmp"
-    echo "runner: $BM_ID: no room in /tmp, running it from the stick"
+    echo "runner: $BM_ID: no room in RAM, running it from the stick"
   fi
+}
+
+# The official application from the stick starts with a copy of the unit's settings (calibration, last state), kept in
+# its own folder on the stick, so the installed software's settings never change.
+seed_official_data() {
+  [ -f "$1/.bootmenu-seeded" ] && return 0
+  if cp -R /root/data/. "$1/" 2>/dev/null; then echo "runner: $BM_ID: settings copied from the unit's /root/data"
+  else echo "runner: $BM_ID: WARNING not all of /root/data could be copied to $1"; fi
+  touch "$1/.bootmenu-seeded"
 }
 
 # Starts the chosen app (choice.sh is sourced) in the background; APP_PID = its pid.
 launch_app() {
-  app_binary
+  app_binary || { echo "runner: ERROR $BM_ID could not be decrypted (no key on this unit, or no room)"; return 1; }
   stop_official
   log_holders "before launching $BM_ID"
   DATA=""
   if [ "$BM_DATA" != none ] && [ -n "$BM_DATA" ]; then
     DATA="$USB_RUN/$BM_DATA"
-    if ! mkdir -p "$DATA/$BM_ID" 2>/dev/null; then
-      DATA="$STAGE/data/$BM_ID"; mkdir -p "$DATA/$BM_ID"
+    # the official application keeps its files straight in /root/data; other apps in /root/data/<id>
+    sub="/$BM_ID"; [ "$BM_OFFICIAL_BUILD" = 1 ] && sub=""
+    if ! mkdir -p "$DATA$sub" 2>/dev/null; then
+      DATA="$STAGE/data/$BM_ID"; mkdir -p "$DATA$sub"
       echo "runner: WARNING could not create $USB_RUN/$BM_DATA, using RAM ($DATA); data is lost on exit"
     fi
+    [ "$BM_OFFICIAL_BUILD" = 1 ] && seed_official_data "$DATA"
   fi
   if [ -n "$DATA" ] && [ "$MOUNT_MODE" = global ]; then
     if mount -o bind "$DATA" /root/data; then GLOBAL_MOUNT=1
@@ -371,7 +413,7 @@ run_menu() {
 
 load_choice() {
   BM_KIND=""; BM_ID=""; BM_NAME=""; BM_SOURCE=""; BM_EXE=""; BM_DIR=""; BM_ARGS=""; BM_DATA=""; BM_CONF=""
-  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""
+  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""; BM_ENCRYPTED=""; BM_OFFICIAL_BUILD=""
   . "$STAGE/choice.sh"
 }
 

@@ -1,7 +1,8 @@
 /* Boot menu for the SP-16 USB autoexec hook: shared declarations.
  *
  * The program runs as root in place of the official application. It lists the executables it can launch (apps beside
- * autoexec.bin on the stick, apps embedded in autoexec.bin, the official software), draws an OpenGL ES 2 menu on the
+ * autoexec.bin on the stick, plain or encrypted with the unit's key, apps embedded in autoexec.bin, the official
+ * software), draws an OpenGL ES 2 menu on the
  * Vivante GPU and reads the panel's SELECT encoder, its push, BACK/HOME and the LCD touch. It never launches
  * anything itself: it writes the choice as shell assignments (choice.sh) and exits, so the GPU, the framebuffer
  * and the panel link are free again before the launcher (image/autoexec.sh) starts the app.
@@ -12,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifndef BM_VERSION
 #define BM_VERSION "dev" /* tools/build.sh passes the VERSION file (plus the commit for builds between releases) */
@@ -32,6 +34,7 @@ typedef struct {
     int scan_root;        /* 1 = list executables in the stick root (beside autoexec.bin) */
     int show_official;       /* 1 = list the official software */
     int official_wait_ms;    /* how long the official app may take to exit after SIGTERM before SIGKILL */
+    char key[256];           /* the unit's key file, for encrypted programs (--key; default BM_KEY) */
 } Config;
 void config_defaults(Config *c);
 void config_load(Config *c, const char *path); /* missing file = defaults */
@@ -55,10 +58,12 @@ typedef struct {
     long long size;        /* executable size in bytes */
     long mtime;
     int ready;             /* embedded apps: 1 once autoexec.sh finished copying them out of the image */
-    char detail[96];       /* subtitle text: where it is, version, size, date */
+    char detail[128];      /* subtitle text: what and where it is, version, size, date */
     char version[24];      /* from the executable's app-info note, "" if it has none */
     int icon_w, icon_h;    /* app-info icon (RGBA8), 0 = none: draw the letter tile */
     long icon_off;         /* file offset of the icon pixels */
+    int encrypted;         /* 1 = the file is encrypted with the unit's key (crypt.c): the launcher decrypts it to RAM */
+    int official_build;    /* 1 = the official SP-16 application (EP085_Main_R) under any file name: runs in /root/pdj */
 } App;
 
 typedef struct {
@@ -77,13 +82,23 @@ void apps_remember(const Config *c, const App *a);  /* writes <stick>/bootmenu.l
 int apps_any_unready(const AppList *l);
 /* Writes the choice as shell assignments; 0 on success. */
 int apps_write_choice(const App *a, const char *path);
-/* ELF check: 1 = an ARM 32-bit little-endian soft-float executable this unit can run. `why` gets the reason if not. */
-int elf_compatible(const char *path, char *why, size_t whylen);
+/* ELF check: 1 = an ARM 32-bit little-endian soft-float executable this unit can run. `why` gets the reason if not.
+ * encrypted: read the file through the unit's key. */
+int elf_compatible(const char *path, int encrypted, char *why, size_t whylen);
 /* The app-info ELF note (owner "APPINFO", see docs/apps.md): display name, version
  * and an RGBA icon. Fills name (when the app has no ini name=), version and the icon fields; 1 when found. */
 int elf_appinfo(App *a);
 /* Reads the icon pixels (icon_w * icon_h * 4 bytes) into dst; 0 on success. */
 int apps_load_icon(const App *a, uint8_t *dst);
+
+/* ---- encrypted programs (crypt.c) ---------------------------------------------------------------------------- */
+#ifndef BM_KEY
+#define BM_KEY "/usr/local/pdj/aes256.key" /* the unit's own key, the one its USB autoexec hook uses */
+#endif
+int crypt_key_load(const char *path);  /* 1 when the key is loaded (read once; later calls return the result) */
+/* pread through the key: decrypts the sectors [off, off + len) is in. Returns the bytes read, -1 without a key. */
+ssize_t crypt_pread(int fd, void *dst, size_t len, off_t off);
+int crypt_decrypt_file(const char *path, int out_fd); /* the whole program, decrypted, to out_fd; 0 on success */
 
 /* ---- official app (official.c) -------------------------------------------------------------------------------------- */
 int official_signal(int sig);                  /* signals every live EP085_Main_R; returns how many */

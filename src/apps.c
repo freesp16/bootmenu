@@ -8,6 +8,11 @@
  *                                            a .pending file means the copy is still running
  *  official                                     the unit's own application (the launcher restarts it)
  *
+ * Any of the stick's programs may be encrypted with the unit's key (crypt.c): recognised by content, listed under its
+ * file name like a plain one, decrypted into RAM by the launcher at start. The official application itself
+ * (EP085_Main_R) may be on the stick too, plain or encrypted, under any file name: recognised by content, it runs in
+ * /root/pdj as the installed one does, with its settings on the stick (see official_build()).
+ *
  * Settings (.ini / app.ini, key=value, all optional):
  *   name=  description=  exe= (folder apps)  args=  data= (stick folder bound over /root/data; none = no redirect)
  *   conf= (stick file exported as <prefix><KEY>=value)  prefix=  run_from=ram|stick  accent=#rrggbb  hidden=1
@@ -65,6 +70,7 @@ void config_defaults(Config *c) {
     c->scan_root = 1;
     c->show_official = 1;
     c->official_wait_ms = 8000;
+    copy(c->key, sizeof c->key, BM_KEY);
 }
 
 static void config_kv(void *user, const char *k, const char *v) {
@@ -90,13 +96,24 @@ void config_load(Config *c, const char *path) {
 /* ---- ELF check ------------------------------------------------------------------------------------------------- */
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
 
-int elf_compatible(const char *path, char *why, size_t whylen) {
+/* A program file read as it is, or through the unit's key. */
+typedef struct {
+    int fd, enc;
+} Src;
+
+static ssize_t src_read(const Src *s, void *buf, size_t n, off_t off) {
+    return s->enc ? crypt_pread(s->fd, buf, n, off) : pread(s->fd, buf, n, off);
+}
+
+int elf_compatible(const char *path, int encrypted, char *why, size_t whylen) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return snprintf(why, whylen, "cannot open"), 0;
+    const Src src = {fd, encrypted};
     uint8_t h[52];
     int ok = 0;
-    if (read(fd, h, sizeof h) != (ssize_t)sizeof h || memcmp(h, "\177ELF", 4) != 0) {
+    if (src_read(&src, h, sizeof h, 0) != (ssize_t)sizeof h || memcmp(h, "\177ELF", 4) != 0) {
         snprintf(why, whylen, "not an ELF file");
 #ifdef BM_DEV_HOST
     } else if (h[4] == 2 && h[5] == 1 && le16(h + 18) == 62) {
@@ -110,11 +127,11 @@ int elf_compatible(const char *path, char *why, size_t whylen) {
         char interp[64] = "";
         for (int i = 0; i < phnum && i < 32 && phentsize >= 32; i++) {
             uint8_t ph[32];
-            if (pread(fd, ph, sizeof ph, (off_t)phoff + (off_t)i * phentsize) != (ssize_t)sizeof ph) break;
+            if (src_read(&src, ph, sizeof ph, (off_t)phoff + (off_t)i * phentsize) != (ssize_t)sizeof ph) break;
             if (le32(ph) == 3 /* PT_INTERP */) {
                 uint32_t off = le32(ph + 4), sz = le32(ph + 16);
                 if (sz >= sizeof interp) sz = sizeof interp - 1;
-                ssize_t r = pread(fd, interp, sz, (off_t)off);
+                ssize_t r = src_read(&src, interp, sz, (off_t)off);
                 interp[r > 0 ? r : 0] = 0;
             }
         }
@@ -134,8 +151,6 @@ int elf_compatible(const char *path, char *why, size_t whylen) {
  * In a PT_NOTE segment: namesz=8, descsz, type=1, "APPINFO\0", then the descriptor: "AINF", u16 format=1,
  * u16 header=128, char name[48], char version[24], char id[40], u16 w, u16 h, u32 pixel format=1 (RGBA8), pixels.
  * Only the program headers and the note headers are read (a few hundred bytes); the pixels when drawn. */
-static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
-
 static void fixed_string(char *dst, size_t n, const uint8_t *src, size_t srclen) {
     size_t k = 0;
     while (k < srclen && k + 1 < n && src[k]) {
@@ -148,27 +163,28 @@ static void fixed_string(char *dst, size_t n, const uint8_t *src, size_t srclen)
 int elf_appinfo(App *a) {
     int fd = open(a->exe, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
+    const Src src = {fd, a->encrypted};
     uint8_t h[64];
     int found = 0;
-    if (read(fd, h, sizeof h) == (ssize_t)sizeof h && !memcmp(h, "\177ELF", 4) && h[5] == 1) {
+    if (src_read(&src, h, sizeof h, 0) == (ssize_t)sizeof h && !memcmp(h, "\177ELF", 4) && h[5] == 1) {
         int is64 = h[4] == 2;
         uint64_t phoff = is64 ? le64(h + 32) : le32(h + 28);
         uint16_t phentsize = le16(h + (is64 ? 54 : 42)), phnum = le16(h + (is64 ? 56 : 44));
         for (int i = 0; i < phnum && i < 32 && !found; i++) {
             uint8_t ph[56];
-            if (phentsize > sizeof ph || pread(fd, ph, phentsize, (off_t)(phoff + (uint64_t)i * phentsize)) != phentsize)
+            if (phentsize > sizeof ph || src_read(&src, ph, phentsize, (off_t)(phoff + (uint64_t)i * phentsize)) != phentsize)
                 break;
             if (le32(ph) != 4 /* PT_NOTE */) continue;
             uint64_t off = is64 ? le64(ph + 8) : le32(ph + 4), size = is64 ? le64(ph + 32) : le32(ph + 16);
             uint64_t pos = off, end = off + size;
             while (pos + 12 <= end && !found) {
                 uint8_t nh[20];
-                if (pread(fd, nh, 20, (off_t)pos) != 20) break;
+                if (src_read(&src, nh, 20, (off_t)pos) != 20) break;
                 uint32_t namesz = le32(nh), descsz = le32(nh + 4), type = le32(nh + 8);
                 uint64_t desc = pos + 12 + ((namesz + 3u) & ~3u);
                 if (namesz == 8 && type == 1 && !memcmp(nh + 12, "APPINFO", 8) && descsz >= 128 && desc + descsz <= end) {
                     uint8_t d[128];
-                    if (pread(fd, d, sizeof d, (off_t)desc) == (ssize_t)sizeof d && !memcmp(d, "AINF", 4) &&
+                    if (src_read(&src, d, sizeof d, (off_t)desc) == (ssize_t)sizeof d && !memcmp(d, "AINF", 4) &&
                         le16(d + 4) == 1) {
                         uint16_t hdr = le16(d + 6), w = le16(d + 120), ht = le16(d + 122);
                         found = 1;
@@ -194,9 +210,86 @@ int apps_load_icon(const App *a, uint8_t *dst) {
     int fd = open(a->exe, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     size_t n = (size_t)a->icon_w * (size_t)a->icon_h * 4;
-    ssize_t r = pread(fd, dst, n, (off_t)a->icon_off);
+    const Src src = {fd, a->encrypted};
+    ssize_t r = src_read(&src, dst, n, (off_t)a->icon_off);
     close(fd);
     return r == (ssize_t)n ? 0 : -1;
+}
+
+/* The official application's size for each official release (PioneerSP16FirmwareResearch/docs/firmware-reference.md,
+ * "Application binary identities"). The sizes are all different, so one stat() tells the installed version; a
+ * SHA-256 of the 12 MB file would cost a noticeable part of a second on the A9 at every start. */
+static const struct {
+    long long bytes;
+    const char *version;
+} OFFICIAL_RELEASES[] = {
+    {10724172, "1.20"}, {11172172, "1.30"}, {11171172, "1.31"},
+    {11676132, "1.40"}, {11993612, "1.50"}, {12000396, "1.60"},
+};
+
+static const char *release_for_size(long long bytes) {
+    for (size_t i = 0; i < sizeof OFFICIAL_RELEASES / sizeof OFFICIAL_RELEASES[0]; i++)
+        if (OFFICIAL_RELEASES[i].bytes == bytes) return OFFICIAL_RELEASES[i].version;
+    return NULL;
+}
+
+/* ---- the official application under another name -------------------------------------------------------------
+ * EP085_Main_R was built in Pioneer DJ's i.MX6 tree: its DT_RPATH names /home/iMX6/ltib/. That is read from the
+ * program headers, the dynamic section and the path string (a few KB, through the key when encrypted), so a copy
+ * of the official application is recognised whatever its file name. *elf_bytes gets the program's own length (the
+ * section headers end it), which tells the release even through an encrypted file's padding. */
+#define OFFICIAL_RPATH "/home/iMX6/ltib/"
+
+static int official_build(const char *path, int encrypted, long long *elf_bytes) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    const Src src = {fd, encrypted};
+    uint8_t h[64];
+    int found = 0;
+    *elf_bytes = 0;
+    if (src_read(&src, h, sizeof h, 0) != (ssize_t)sizeof h || memcmp(h, "\177ELF", 4) || h[5] != 1) goto out;
+    const int is64 = h[4] == 2;
+    const uint64_t phoff = is64 ? le64(h + 32) : le32(h + 28), shoff = is64 ? le64(h + 40) : le32(h + 32);
+    const uint16_t phentsize = le16(h + (is64 ? 54 : 42)), phnum = le16(h + (is64 ? 56 : 44));
+    const uint16_t shentsize = le16(h + (is64 ? 58 : 46)), shnum = le16(h + (is64 ? 60 : 48));
+    if (shoff) *elf_bytes = (long long)(shoff + (uint64_t)shentsize * shnum);
+    uint64_t dyn_off = 0, dyn_size = 0, load_vaddr[8], load_off[8], load_size[8];
+    int loads = 0;
+    for (int i = 0; i < phnum && i < 32; i++) {
+        uint8_t ph[56];
+        if (phentsize > sizeof ph || src_read(&src, ph, phentsize, (off_t)(phoff + (uint64_t)i * phentsize)) != phentsize)
+            goto out;
+        uint32_t type = le32(ph);
+        uint64_t off = is64 ? le64(ph + 8) : le32(ph + 4), vaddr = is64 ? le64(ph + 16) : le32(ph + 8);
+        uint64_t filesz = is64 ? le64(ph + 32) : le32(ph + 16);
+        if (type == 2 /* PT_DYNAMIC */) dyn_off = off, dyn_size = filesz;
+        else if (type == 1 /* PT_LOAD */ && loads < 8)
+            load_vaddr[loads] = vaddr, load_off[loads] = off, load_size[loads] = filesz, loads++;
+    }
+    if (!dyn_size) goto out;
+    uint8_t dyn[2048];
+    const size_t entsize = is64 ? 16 : 8;
+    ssize_t got = src_read(&src, dyn, dyn_size < sizeof dyn ? (size_t)dyn_size : sizeof dyn, (off_t)dyn_off);
+    uint64_t strtab = 0, rpath = UINT64_MAX;
+    for (ssize_t k = 0; k + (ssize_t)entsize <= got; k += (ssize_t)entsize) {
+        uint64_t tag = is64 ? le64(dyn + k) : le32(dyn + k), val = is64 ? le64(dyn + k + 8) : le32(dyn + k + 4);
+        if (tag == 0) break;
+        if (tag == 5 /* DT_STRTAB */) strtab = val;
+        else if (tag == 15 /* DT_RPATH */ || tag == 29 /* DT_RUNPATH */) rpath = val;
+    }
+    if (!strtab || rpath == UINT64_MAX) goto out;
+    for (int i = 0; i < loads; i++)
+        if (strtab >= load_vaddr[i] && strtab < load_vaddr[i] + load_size[i]) {
+            char str[512];
+            off_t at = (off_t)(strtab - load_vaddr[i] + load_off[i] + rpath);
+            ssize_t r = src_read(&src, str, sizeof str - 1, at);
+            str[r > 0 ? r : 0] = 0;
+            found = strstr(str, OFFICIAL_RPATH) != NULL;
+            break;
+        }
+out:
+    close(fd);
+    return found;
 }
 
 /* ---- app entries ----------------------------------------------------------------------------------------------- */
@@ -231,11 +324,28 @@ static void app_kv(void *user, const char *k, const char *v) {
     else if (!strcmp(k, "hidden")) x->hidden = atoi(v);
 }
 
-/* The id of a file: its name without a trailing .bin / .elf / .app. */
+/* The id of a file: its name without a trailing .bin / .elf / .app / .enc. */
 static void id_from_file(char *id, size_t n, const char *file) {
     copy(id, n, file);
     char *dot = strrchr(id, '.');
-    if (dot && (!strcasecmp(dot, ".bin") || !strcasecmp(dot, ".elf") || !strcasecmp(dot, ".app"))) *dot = 0;
+    if (dot && (!strcasecmp(dot, ".bin") || !strcasecmp(dot, ".elf") || !strcasecmp(dot, ".app") ||
+                !strcasecmp(dot, ".enc")))
+        *dot = 0;
+}
+
+/* The key file for encrypted programs (the scan's Config). */
+static const char *key_path = BM_KEY;
+
+/* 1 = a program this unit can run, plain or (when the key is there) encrypted; *enc tells which. Any file that is not
+ * an ELF file costs one 512-byte decryption to tell whether it is an encrypted one. */
+static int probe_program(const char *path, long long size, int *enc, char *why, size_t whylen) {
+    *enc = 0;
+    if (elf_compatible(path, 0, why, whylen)) return 1;
+    if (strcmp(why, "not an ELF file") != 0 || size < 512 || size % 512 != 0 || !crypt_key_load(key_path)) return 0;
+    char why2[96];
+    if (elf_compatible(path, 1, why2, sizeof why2)) return *enc = 1;
+    if (strcmp(why2, "not an ELF file") != 0) snprintf(why, whylen, "encrypted, %s", why2);
+    return 0;
 }
 
 static void app_defaults(App *a, AppSource src, const char *id, const char *dir) {
@@ -264,13 +374,18 @@ static void human_size(char *out, size_t n, long long bytes) {
 static void finish_detail(App *a) {
     static const char *mon[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     char size[24], date[24] = "", ver[32] = "";
-    if (*a->version) snprintf(ver, sizeof ver, "v%s \xC2\xB7 ", a->version);
     human_size(size, sizeof size, a->size);
     time_t t = (time_t)a->mtime;
     struct tm tm;
     if (a->mtime > 0 && localtime_r(&t, &tm) && tm.tm_year > 90)
         snprintf(date, sizeof date, " \xC2\xB7 %d %s %d", tm.tm_mday, mon[tm.tm_mon], tm.tm_year + 1900);
-    const char *where = a->source == SRC_STICK ? "On the USB stick" : "Inside autoexec.bin";
+    /* where it runs from, and whether it is encrypted, are the row's chips */
+    char where[64];
+    if (a->official_build)
+        snprintf(where, sizeof where, "Official SP-16 software %s", *a->version ? a->version : "(unknown version)");
+    else
+        copy(where, sizeof where, a->source == SRC_STICK ? "On the USB stick" : "Inside autoexec.bin");
+    if (*a->version && !a->official_build) snprintf(ver, sizeof ver, "v%s \xC2\xB7 ", a->version);
     if (!a->ready) snprintf(a->detail, sizeof a->detail, "Unpacking from autoexec.bin\xE2\x80\xA6");
     else if (*a->desc) snprintf(a->detail, sizeof a->detail, "%s \xC2\xB7 %s%s", a->desc, ver, size);
     else snprintf(a->detail, sizeof a->detail, "%s \xC2\xB7 %s%s%s", where, ver, size, date);
@@ -299,15 +414,32 @@ static void consider(AppList *l, AppSource src, const char *id, const char *dir,
             l->skipped++;
             return;
         }
-        if (!elf_compatible(a->exe, why, sizeof why)) {
+        if (!probe_program(a->exe, (long long)st.st_size, &a->encrypted, why, sizeof why)) {
             bm_log("apps: skip %s: %s", a->exe, why);
             l->skipped++;
             return;
         }
         a->size = (long long)st.st_size;
         a->mtime = (long)st.st_mtime;
-        if (elf_appinfo(a))
-            bm_log("apps: %s: app info \"%s\" %s, icon %dx%d", a->exe, a->name, a->version, a->icon_w, a->icon_h);
+        long long elf_bytes;
+        if (official_build(a->exe, a->encrypted, &elf_bytes)) {
+            /* the official application from the stick: where and how the installed one runs, its settings on the stick */
+            a->official_build = 1;
+            copy(a->dir, sizeof a->dir, "/root/pdj");
+            /* a release only when the file is exactly that program (plus, encrypted, the padding to 512 bytes): a
+             * modified one may carry more after its section headers */
+            long long whole = a->encrypted ? (elf_bytes + 511) / 512 * 512 : elf_bytes;
+            const char *v = whole == a->size ? release_for_size(elf_bytes) : NULL;
+            copy(a->version, sizeof a->version, v ? v : "");
+            if (a->accent == accent_for(a->id)) a->accent = OFFICIAL_ACCENT;
+            bm_log("apps: %s: the official SP-16 application%s, %s (program %lld bytes, file %lld)", a->exe,
+                   a->encrypted ? " (encrypted)" : "", v ? v : "unknown version", elf_bytes, a->size);
+        } else if (elf_appinfo(a)) {
+            bm_log("apps: %s: app info \"%s\" %s, icon %dx%d%s", a->exe, a->name, a->version, a->icon_w, a->icon_h,
+                   a->encrypted ? " (encrypted)" : "");
+        } else if (a->encrypted) {
+            bm_log("apps: %s: encrypted program", a->exe);
+        }
     }
     finish_detail(a);
     l->n++;
@@ -337,7 +469,8 @@ static void scan_files(AppList *l, const char *dir) {
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 52) continue;
         char why[96];
-        if (!elf_compatible(path, why, sizeof why)) {
+        int enc;
+        if (!probe_program(path, (long long)st.st_size, &enc, why, sizeof why)) {
             if (strcmp(why, "not an ELF file") != 0) {
                 bm_log("apps: skip %s: %s", path, why);
                 l->skipped++;
@@ -378,17 +511,6 @@ static int by_name(const void *a, const void *b) {
     return c ? c : strcasecmp(x->id, y->id);
 }
 
-/* The official application's size for each official release (PioneerSP16FirmwareResearch/docs/firmware-reference.md,
- * "Application binary identities"). The sizes are all different, so one stat() tells the installed version; a
- * SHA-256 of the 12 MB file would cost a noticeable part of a second on the A9 at every start. */
-static const struct {
-    long long bytes;
-    const char *version;
-} OFFICIAL_RELEASES[] = {
-    {10724172, "1.20"}, {11172172, "1.30"}, {11171172, "1.31"},
-    {11676132, "1.40"}, {11993612, "1.50"}, {12000396, "1.60"},
-};
-
 static void official_entry(App *a) {
     app_defaults(a, SRC_OFFICIAL, "official", "/root/pdj");
     copy(a->name, sizeof a->name, "Pioneer DJ - Toraiz SP-16");
@@ -403,9 +525,7 @@ static void official_entry(App *a) {
     }
     a->size = (long long)st.st_size;
     a->mtime = (long)st.st_mtime;
-    const char *v = NULL;
-    for (size_t i = 0; i < sizeof OFFICIAL_RELEASES / sizeof OFFICIAL_RELEASES[0]; i++)
-        if (OFFICIAL_RELEASES[i].bytes == a->size) v = OFFICIAL_RELEASES[i].version;
+    const char *v = release_for_size(a->size);
     if (v) {
         snprintf(a->detail, sizeof a->detail, "Official firmware \xC2\xB7 version %s", v);
     } else {
@@ -416,6 +536,7 @@ static void official_entry(App *a) {
 
 void apps_scan(AppList *l, const Config *c) {
     double t0 = bm_now();
+    key_path = c->key;
     l->n = l->skipped = 0;
     /* the official firmware always comes first */
     if (c->show_official) official_entry(&l->app[l->n++]);
@@ -525,6 +646,8 @@ int apps_write_choice(const App *a, const char *path) {
     put(f, "BM_CONF", a->conf);
     put(f, "BM_PREFIX", a->prefix);
     put(f, "BM_RUN_FROM", a->run_from);
+    put(f, "BM_ENCRYPTED", a->encrypted ? "1" : "0");
+    put(f, "BM_OFFICIAL_BUILD", a->official_build ? "1" : "0");
     snprintf(num, sizeof num, "%lld", a->size);
     put(f, "BM_SIZE", num);
     snprintf(num, sizeof num, "%ld", a->mtime);

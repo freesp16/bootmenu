@@ -7,8 +7,10 @@ the unit runs: its official software, or community software from the stick.
 
 - **Runs from the stick only.** Nothing is installed and nothing is written to the unit's internal memory. Pull the
   stick and the official software comes back.
-- **Launches community software.** Any compatible program copied next to `autoexec.bin` shows up in the list.
-  Updating it means copying a new file.
+- **Launches community software.** Any compatible program copied next to `autoexec.bin` shows up in the list,
+  plain or encrypted with the unit's key, under its file name. Updating it means copying a new file.
+- **Runs the official software from the stick.** A copy of the official application (`EP085_Main_R`), under any
+  file name and plain or encrypted, runs from the stick without replacing the installed one.
 - **Built for the hardware.** It starts while the official software is still shutting down and draws on the GPU,
   so the menu is on screen quickly and reacts immediately to the SELECT encoder.
 - **Remembers your choice.** The last app you started becomes the default and starts on its own after a short
