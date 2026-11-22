@@ -38,8 +38,8 @@ jobs:
         run: tools/build.sh
       - name: Test
         run: |
-          tools/test-arm.sh
           sudo apt-get update && sudo apt-get install -y --no-install-recommends busybox-static xorriso python3-cryptography
+          tools/test-arm.sh
           tools/test-launcher.sh
       - name: autoexec.bin
         env:

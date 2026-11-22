@@ -1,10 +1,10 @@
 /* Boot menu for the SP-16 USB autoexec hook: shared declarations.
  *
  * The program runs as root in place of the official application. It lists the executables it can launch (apps beside
- * autoexec.bin on the stick, apps embedded in autoexec.bin, the official software), draws an OpenGL ES 2 menu on the
- * Vivante GPU and reads the panel's SELECT encoder, its push, BACK/HOME and the LCD touch. It never launches
- * anything itself: it writes the choice as shell assignments (choice.sh) and exits, so the GPU, the framebuffer
- * and the panel link are free again before the launcher (image/autoexec.sh) starts the app.
+ * autoexec.bin on the stick, apps embedded in autoexec.bin, the official software, official update files run live),
+ * draws an OpenGL ES 2 menu on the Vivante GPU and reads the panel's SELECT encoder, its push, BACK/HOME and the LCD
+ * touch. It never launches anything itself: it writes the choice as shell assignments (choice.sh) and exits, so the
+ * GPU, the framebuffer and the panel link are free again before the launcher (image/autoexec.sh) starts the app.
  *
  * Plain C99 + POSIX, one thread, no allocation after start-up except the app list (rebuilt on a rescan). */
 #ifndef BM_H
@@ -59,6 +59,7 @@ typedef struct {
     char version[24];      /* from the executable's app-info note, "" if it has none */
     int icon_w, icon_h;    /* app-info icon (RGBA8), 0 = none: draw the letter tile */
     long icon_off;         /* file offset of the icon pixels */
+    int firmware;          /* 1 = an official update file (.UPD) run live: exe is the .UPD, version its release */
 } App;
 
 typedef struct {
@@ -84,6 +85,15 @@ int elf_compatible(const char *path, char *why, size_t whylen);
 int elf_appinfo(App *a);
 /* Reads the icon pixels (icon_w * icon_h * 4 bytes) into dst; 0 on success. */
 int apps_load_icon(const App *a, uint8_t *dst);
+
+/* ---- official update files (upd.c) --------------------------------------------------------------------------- */
+#ifndef BM_UPD_KEY
+#define BM_UPD_KEY "/usr/local/pdj/aes256.key" /* the unit's own key, the one its USB autoexec hook uses */
+#endif
+/* 1 when the file ends in an SP-16 update trailer; version gets the release ("1.60"). Reads 20 bytes. */
+int upd_probe(const char *path, char *version, size_t vlen);
+/* Decrypts one file of the update's image (e.g. "images/pdj.tar.gz") to out_fd; 0 on success. */
+int upd_extract(const char *upd_path, const char *key_path, const char *member, int out_fd);
 
 /* ---- official app (official.c) -------------------------------------------------------------------------------------- */
 int official_signal(int sig);                  /* signals every live EP085_Main_R; returns how many */

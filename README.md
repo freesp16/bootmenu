@@ -9,6 +9,9 @@ the unit runs: its official software, or community software from the stick.
   stick and the official software comes back.
 - **Launches community software.** Any compatible program copied next to `autoexec.bin` shows up in the list.
   Updating it means copying a new file.
+- **Runs official firmware live.** An official update file (`TORAIZSP16.UPD`) on the stick is listed with its
+  version and runs straight from the stick, labelled *(live usb)*. It is never installed: try another firmware
+  version without touching the one on the unit.
 - **Built for the hardware.** It starts while the official software is still shutting down and draws on the GPU,
   so the menu is on screen quickly and reacts immediately to the SELECT encoder.
 - **Remembers your choice.** The last app you started becomes the default and starts on its own after a short

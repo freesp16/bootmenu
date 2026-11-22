@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| `src/` | the menu, C99: start-up and loop (`main.c`), OpenGL ES (`gfx.c`), the screen (`ui.c`), app discovery (`apps.c`), panel input (`panel.c`) |
+| `src/` | the menu, C99: start-up and loop (`main.c`), OpenGL ES (`gfx.c`), the screen (`ui.c`), app discovery (`apps.c`), official update files (`upd.c`), panel input (`panel.c`) |
 | `image/` | the scripts inside `autoexec.bin`: `autoexec.sh` (logs, then runs `launcher.sh`) and `launcher.sh` (runs the menu, then the chosen app) |
 | `toolchain/` | the build container: Debian's armel cross GCC with a glibc 2.13 sysroot |
 | `tools/` | build, image, tests |
@@ -14,10 +14,13 @@
 
 ```bash
 tools/build.sh            # out/bootmenu; builds the toolchain image the first time (a few minutes)
-tools/test-arm.sh         # the armel build under qemu: discovery, compatibility check, app-info note, choices
+tools/test-arm.sh         # the armel build under qemu: discovery, compatibility check, app-info note, choices, .UPD
 tools/test-launcher.sh    # the scripts end to end in a container standing in for the unit (needs busybox-static)
 tools/host-run.sh STICK   # a native build in a window on a Linux PC (Mesa), to see the screen
 ```
+
+Both tests use a stand-in update file made by `tools/make-test-upd.py` with a throwaway key (needs `xorriso` and
+`python3-cryptography`); no official firmware is involved.
 
 The version comes from `VERSION`. Builds that are not on the matching tag report `<version>-dev+<commit>`.
 

@@ -7,6 +7,8 @@
  *  embedded        <embedded>/<id>/          copied out of autoexec.bin by autoexec.sh (app.ini + the executable);
  *                                            a .pending file means the copy is still running
  *  official                                     the unit's own application (the launcher restarts it)
+ *  update files    <stick>/<name>.UPD        an official firmware update, run live without installing it (upd.c):
+ *                  (root and apps/)          listed with the version from its trailer; settings in <name>.ini
  *
  * Settings (.ini / app.ini, key=value, all optional):
  *   name=  description=  exe= (folder apps)  args=  data= (stick folder bound over /root/data; none = no redirect)
@@ -313,6 +315,80 @@ static void consider(AppList *l, AppSource src, const char *id, const char *dir,
     l->n++;
 }
 
+/* The official application's size for each official release (PioneerSP16FirmwareResearch/docs/firmware-reference.md,
+ * "Application binary identities"). The sizes are all different, so one stat() tells the installed version; a
+ * SHA-256 of the 12 MB file would cost a noticeable part of a second on the A9 at every start. */
+static const struct {
+    long long bytes;
+    const char *version;
+} OFFICIAL_RELEASES[] = {
+    {10724172, "1.20"}, {11172172, "1.30"}, {11171172, "1.31"},
+    {11676132, "1.40"}, {11993612, "1.50"}, {12000396, "1.60"},
+};
+#define OFFICIAL_EXE "/root/pdj/EP085_Main_R"
+
+/* The installed release, from the size of OFFICIAL_EXE; NULL when unknown. size gets the size (-1 = not found). */
+static const char *installed_version(long long *size, long *mtime) {
+    struct stat st;
+    *size = -1;
+    if (stat(OFFICIAL_EXE, &st) != 0) return NULL;
+    *size = (long long)st.st_size;
+    if (mtime) *mtime = (long)st.st_mtime;
+    for (size_t i = 0; i < sizeof OFFICIAL_RELEASES / sizeof OFFICIAL_RELEASES[0]; i++)
+        if (OFFICIAL_RELEASES[i].bytes == *size) return OFFICIAL_RELEASES[i].version;
+    return NULL;
+}
+
+static int has_ext(const char *name, const char *ext) {
+    const char *dot = strrchr(name, '.');
+    return dot && !strcasecmp(dot, ext);
+}
+
+/* An official update file: listed when its trailer says so (20 bytes read), id firmware-<version>. The launcher
+ * decrypts the update's EP085_Main_R and GUI resources out of it at launch (bootmenu --upd ... --extract). */
+static void consider_update(AppList *l, const char *dir, const char *file, const char *path) {
+    if (l->n >= BM_MAX_APPS) return;
+    char version[8], id[64], base[64], ini[384];
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return;
+    if (!upd_probe(path, version, sizeof version)) {
+        bm_log("apps: skip %s: not an SP-16 firmware update file", path);
+        l->skipped++;
+        return;
+    }
+    snprintf(id, sizeof id, "firmware-%s", version);
+    for (int i = 0; i < l->n; i++)
+        if (l->app[i].firmware && !strcmp(l->app[i].id, id)) {
+            bm_log("apps: skip %s: firmware %s is already listed (%s)", path, version, l->app[i].exe);
+            l->skipped++;
+            return;
+        }
+    App *a = &l->app[l->n];
+    app_defaults(a, SRC_STICK, id, "/root/pdj");
+    a->firmware = 1;
+    copy(a->exe, sizeof a->exe, path);
+    copy(a->version, sizeof a->version, version);
+    snprintf(a->name, sizeof a->name, "Pioneer DJ - Toraiz SP-16 %s (live usb)", version);
+    a->conf[0] = a->prefix[0] = a->args[0] = 0;
+    a->accent = OFFICIAL_ACCENT;
+    copy(base, sizeof base, file);
+    base[strlen(base) - 4] = 0; /* without .UPD */
+    snprintf(ini, sizeof ini, "%s/%s.ini", dir, base);
+    IniCtx x = {a, 0};
+    read_kv(ini, app_kv, &x);
+    if (x.hidden) return;
+    copy(a->exe, sizeof a->exe, path); /* exe= has no meaning here */
+    a->size = (long long)st.st_size;
+    a->mtime = (long)st.st_mtime;
+    long long isize;
+    const char *inst = installed_version(&isize, NULL);
+    const char *state = inst && !strcmp(inst, version) ? "same as installed" : "not installed";
+    if (*a->desc) snprintf(a->detail, sizeof a->detail, "%s \xC2\xB7 %s", a->desc, file);
+    else snprintf(a->detail, sizeof a->detail, "Firmware %s \xC2\xB7 %s \xC2\xB7 %s", version, file, state);
+    bm_log("apps: %s: firmware update %s (installed: %s)", path, version, inst ? inst : "unknown");
+    l->n++;
+}
+
 static int skip_by_name(const char *name) {
     static const char *ext[] = {".wav", ".aif", ".aiff", ".mp3", ".flac", ".txt", ".md", ".log", ".conf", ".ini",
                                 ".json", ".prj", ".dat", ".key", ".last", ".sh", ".py", ".png", ".jpg", ".pdf",
@@ -331,9 +407,13 @@ static void scan_files(AppList *l, const char *dir) {
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
-        if (skip_by_name(e->d_name)) continue;
         char path[320], id[64], ini[384];
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        if (e->d_name[0] != '.' && has_ext(e->d_name, ".upd")) {
+            consider_update(l, dir, e->d_name, path);
+            continue;
+        }
+        if (skip_by_name(e->d_name)) continue;
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 52) continue;
         char why[96];
@@ -372,40 +452,28 @@ static void scan_folders(AppList *l, const char *parent, AppSource src) {
     closedir(d);
 }
 
+/* Firmware updates first (newest release first), then the apps by name. */
 static int by_name(const void *a, const void *b) {
     const App *x = a, *y = b;
+    if (x->firmware != y->firmware) return y->firmware - x->firmware;
+    if (x->firmware) return -strcmp(x->version, y->version);
     int c = strcasecmp(x->name, y->name);
     return c ? c : strcasecmp(x->id, y->id);
 }
 
-/* The official application's size for each official release (PioneerSP16FirmwareResearch/docs/firmware-reference.md,
- * "Application binary identities"). The sizes are all different, so one stat() tells the installed version; a
- * SHA-256 of the 12 MB file would cost a noticeable part of a second on the A9 at every start. */
-static const struct {
-    long long bytes;
-    const char *version;
-} OFFICIAL_RELEASES[] = {
-    {10724172, "1.20"}, {11172172, "1.30"}, {11171172, "1.31"},
-    {11676132, "1.40"}, {11993612, "1.50"}, {12000396, "1.60"},
-};
-
 static void official_entry(App *a) {
     app_defaults(a, SRC_OFFICIAL, "official", "/root/pdj");
     copy(a->name, sizeof a->name, "Pioneer DJ - Toraiz SP-16");
-    copy(a->exe, sizeof a->exe, "/root/pdj/EP085_Main_R");
+    copy(a->exe, sizeof a->exe, OFFICIAL_EXE);
     copy(a->data, sizeof a->data, "none");
     a->accent = OFFICIAL_ACCENT;
-    struct stat st;
-    if (stat(a->exe, &st) != 0) {
+    const char *v = installed_version(&a->size, &a->mtime);
+    if (a->size < 0) {
+        a->size = 0;
         copy(a->detail, sizeof a->detail, "Official firmware \xC2\xB7 not found on this system");
         bm_log("official: %s not found", a->exe);
         return;
     }
-    a->size = (long long)st.st_size;
-    a->mtime = (long)st.st_mtime;
-    const char *v = NULL;
-    for (size_t i = 0; i < sizeof OFFICIAL_RELEASES / sizeof OFFICIAL_RELEASES[0]; i++)
-        if (OFFICIAL_RELEASES[i].bytes == a->size) v = OFFICIAL_RELEASES[i].version;
     if (v) {
         snprintf(a->detail, sizeof a->detail, "Official firmware \xC2\xB7 version %s", v);
     } else {
@@ -514,7 +582,7 @@ int apps_write_choice(const App *a, const char *path) {
         bm_log("choice: cannot write %s: %s", tmp, strerror(errno));
         return -1;
     }
-    put(f, "BM_KIND", a->source == SRC_OFFICIAL ? "official" : "app");
+    put(f, "BM_KIND", a->source == SRC_OFFICIAL ? "official" : a->firmware ? "firmware" : "app");
     put(f, "BM_ID", a->id);
     put(f, "BM_NAME", a->name);
     put(f, "BM_SOURCE", source_name(a->source));
@@ -525,6 +593,7 @@ int apps_write_choice(const App *a, const char *path) {
     put(f, "BM_CONF", a->conf);
     put(f, "BM_PREFIX", a->prefix);
     put(f, "BM_RUN_FROM", a->run_from);
+    put(f, "BM_VERSION", a->version);
     snprintf(num, sizeof num, "%lld", a->size);
     put(f, "BM_SIZE", num);
     snprintf(num, sizeof num, "%ld", a->mtime);

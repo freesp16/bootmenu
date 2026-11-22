@@ -12,6 +12,9 @@
 #
 # $1 = the USB stick mount path (writable FAT32).
 #
+# Official firmware updates on the stick (TORAIZSP16.UPD, root or apps/) are listed too and run live: the update's own
+# EP085_Main_R and GUI resources are decrypted out of it with the unit's own key into RAM, nothing is installed.
+#
 # The image holds:
 #   bootmenu          the menu
 #   apps/<id>/        embedded apps (app.ini + the executable), optional
@@ -28,7 +31,7 @@
 # Written to the stick:
 #   bootmenu.log      this script, the runner, the menu, the SSH server and the apps' output
 #   bootmenu.last     the last choice (the menu's default)
-#   <id>-data/        an app's /root/data (the stick, never NAND)
+#   <id>-data/        an app's /root/data (the stick, never NAND); for a live firmware, seeded once from the unit's
 #
 # Remote control (ssh root@169.254.16.16, then `ctl help`):
 #   ctl status | menu | run ID | start | official | stop | update [ID] < binary | list | log [N] | follow
@@ -267,7 +270,7 @@ stop_ssh() {
 }
 
 # --- Apps' /root/data off NAND -----------------------------------------------------------------------------------------
-# Preferred: a private mount namespace per launch, so only the app sees the swap. Otherwise a global bind mount
+# Preferred: a private mount namespace per launch, so only the app sees the swap. Otherwise global bind mounts
 # while the app runs, undone before the official app comes back.
 if command -v unshare >/dev/null 2>&1 && unshare -m sh -c 'mount -o bind /tmp /root/data' 2>/dev/null; then
   MOUNT_MODE=ns
@@ -275,14 +278,101 @@ else
   MOUNT_MODE=global
 fi
 echo "runner: /root/data redirect: $MOUNT_MODE"
-GLOBAL_MOUNT=""
+GLOBAL_MOUNTS=""
+
+# global_bind SRC DST: a bind mount that after_app undoes.
+global_bind() {
+  mount -o bind "$1" "$2" || return 1
+  GLOBAL_MOUNTS="$2 $GLOBAL_MOUNTS"
+}
 
 after_app() {
-  if [ -n "$GLOBAL_MOUNT" ]; then
-    umount /root/data 2>/dev/null || umount -l /root/data 2>/dev/null
-    GLOBAL_MOUNT=""
-    echo "runner: /root/data restored"
+  for m in $GLOBAL_MOUNTS; do
+    umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+    echo "runner: $m restored"
+  done
+  GLOBAL_MOUNTS=""
+}
+
+# --- Official firmware from an update file on the stick, run live --------------------------------------------------------
+# The menu decrypts single files of the update's image with the unit's own key (bootmenu --upd FILE --extract PATH);
+# gzip and tar then unpack only what is needed: pdj/EP085_Main_R and pdj/app.rev (images/pdj.tar.gz) and the release's
+# GUI resources, root/gui (in one of the rootfs*.tar.gz). About 21 MB: RAM when there is room, else the stick. Kept for
+# the session (keyed by the file's size and time), one release at a time. The update's own updater never runs.
+FW_RAM="$STAGE/fw"
+FW_STICK="$USB_RUN/bootmenu-cache/fw"
+FW_NEED_KB=32768
+
+# upd_unpack UPD MEMBER DEST [tar names...]: DEST/.err lists what failed ("bootmenu": no such member or it could not
+# be decrypted; "gzip": the stream broke, e.g. tar could not write). tar's own status is ignored: names it does not
+# find are not an error here.
+upd_unpack() {
+  fw_upd=$1; fw_member=$2; fw_dest=$3; shift 3
+  rm -f "$fw_dest/.err"
+  { "$STAGE/bin/bootmenu" --upd "$fw_upd" --extract "$fw_member" || echo bootmenu >> "$fw_dest/.err"; } \
+    | { gzip -dc || echo gzip >> "$fw_dest/.err"; } \
+    | tar xf - -C "$fw_dest" "$@" 2>/dev/null
+  [ ! -f "$fw_dest/.err" ]
+}
+
+# Sets APP_EXE and, when the update has them, FW_GUI and FW_REV (bound over /root/gui and /root/pdj/app.rev).
+firmware_paths() {
+  APP_EXE="$FW/pdj/EP085_Main_R"
+  [ -d "$FW/root/gui" ] && FW_GUI="$FW/root/gui"
+  [ -f "$FW/pdj/app.rev" ] && [ -f /root/pdj/app.rev ] && FW_REV="$FW/pdj/app.rev"
+  echo "runner: $BM_ID: $(tr -d '\r\n' < "$FW/pdj/app.rev" 2>/dev/null), GUI resources: ${FW_GUI:-the installed ones}"
+}
+
+prepare_firmware() {
+  FW_GUI=""; FW_REV=""
+  fw_stamp="$BM_SIZE $BM_MTIME"
+  for FW in "$FW_RAM/$BM_ID" "$FW_STICK/$BM_ID"; do
+    if [ -x "$FW/pdj/EP085_Main_R" ] && [ "$(cat "$FW/.stamp" 2>/dev/null)" = "$fw_stamp" ]; then
+      echo "runner: $BM_ID: unpacked copy is current ($FW)"; firmware_paths; return 0
+    fi
+  done
+  rm -rf "$FW_RAM" "$FW_STICK"
+  fw_free=$(df -k /tmp 2>/dev/null | awk 'NR == 2 { print $4 }')
+  fw_low=""
+  if [ -n "$fw_free" ] && [ "$fw_free" -lt $FW_NEED_KB ]; then
+    echo "runner: $BM_ID: only $fw_free KB free in /tmp, unpacking to the stick"; fw_low=1
   fi
+  for fw_where in ram stick; do
+    if [ "$fw_where" = ram ]; then [ -n "$fw_low" ] && continue; fw_base=$FW_RAM; else fw_base=$FW_STICK; fi
+    FW="$fw_base/$BM_ID"
+    mkdir -p "$FW" 2>/dev/null || continue
+    fw_t0=$(cut -d' ' -f1 /proc/uptime)
+    echo "runner: $BM_ID: unpacking EP085_Main_R from $BM_EXE"
+    if upd_unpack "$BM_EXE" images/pdj.tar.gz "$FW" pdj/EP085_Main_R pdj/app.rev \
+       && dd if="$FW/pdj/EP085_Main_R" bs=4 count=1 2>/dev/null | grep -q ELF; then
+      fw_ok=1
+      for fw_n in 2 1 3 4; do
+        upd_unpack "$BM_EXE" "images/rootfs$fw_n.tar.gz" "$FW" ./root/gui
+        if grep -q gzip "$FW/.err" 2>/dev/null; then fw_ok=""; break; fi
+        [ -d "$FW/root/gui" ] && break
+      done
+      if [ -n "$fw_ok" ]; then
+        rm -f "$FW/.err"
+        echo "$fw_stamp" > "$FW/.stamp"
+        echo "runner: $BM_ID: unpacked to $FW in $(awk -v a="$fw_t0" '{ printf "%.1f", $1 - a }' /proc/uptime) s"
+        firmware_paths; return 0
+      fi
+    fi
+    echo "runner: $BM_ID: could not unpack to $fw_base (failed: $(cat "$FW/.err" 2>/dev/null | tr '\n' ' '))"
+    rm -rf "$FW"
+  done
+  return 1
+}
+
+free_firmware() { [ -d "$FW_RAM" ] && rm -rf "$FW_RAM" && echo "runner: unpacked firmware removed from RAM"; }
+
+# The live firmware keeps its settings on the stick; the first time they are a copy of the unit's own (calibration,
+# last state), so it starts as the installed one would.
+seed_firmware_data() {
+  [ -f "$1/.bootmenu-seeded" ] && return 0
+  if cp -R /root/data/. "$1/" 2>/dev/null; then echo "runner: $BM_ID: settings copied from the unit's /root/data"
+  else echo "runner: $BM_ID: WARNING not all of /root/data could be copied to $1"; fi
+  touch "$1/.bootmenu-seeded"
 }
 
 # The executable to run: stick apps are copied to RAM (cached by size + time) unless run_from=stick or /tmp is full.
@@ -307,33 +397,58 @@ app_binary() {
 
 # Starts the chosen app (choice.sh is sourced) in the background; APP_PID = its pid.
 launch_app() {
-  app_binary
+  FW_GUI=""; FW_REV=""
+  if [ "$BM_KIND" = firmware ]; then
+    prepare_firmware || { echo "runner: ERROR could not unpack $BM_EXE; not starting $BM_ID"; return 1; }
+  else
+    free_firmware
+    app_binary
+  fi
   stop_official
   log_holders "before launching $BM_ID"
   DATA=""
   if [ "$BM_DATA" != none ] && [ -n "$BM_DATA" ]; then
     DATA="$USB_RUN/$BM_DATA"
-    if ! mkdir -p "$DATA/$BM_ID" 2>/dev/null; then
-      DATA="$STAGE/data/$BM_ID"; mkdir -p "$DATA/$BM_ID"
+    data_dir="$DATA/$BM_ID"
+    [ "$BM_KIND" = firmware ] && data_dir="$DATA" # the official software's own layout: its files straight in /root/data
+    if ! mkdir -p "$data_dir" 2>/dev/null; then
+      DATA="$STAGE/data/$BM_ID"; data_dir="$DATA/$BM_ID"
+      [ "$BM_KIND" = firmware ] && data_dir="$DATA"
+      mkdir -p "$data_dir"
       echo "runner: WARNING could not create $USB_RUN/$BM_DATA, using RAM ($DATA); data is lost on exit"
     fi
+    [ "$BM_KIND" = firmware ] && seed_firmware_data "$DATA"
   fi
-  if [ -n "$DATA" ] && [ "$MOUNT_MODE" = global ]; then
-    if mount -o bind "$DATA" /root/data; then GLOBAL_MOUNT=1
-    elif mount -t tmpfs -o size=16m tmpfs /root/data; then
-      GLOBAL_MOUNT=1; echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
-    else
-      echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
+  if [ "$MOUNT_MODE" = global ]; then
+    if [ -n "$DATA" ] && ! global_bind "$DATA" /root/data; then
+      if [ "$BM_KIND" != firmware ] && mount -t tmpfs -o size=16m tmpfs /root/data; then
+        GLOBAL_MOUNTS="/root/data $GLOBAL_MOUNTS"
+        echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
+      else
+        echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
+      fi
     fi
+    if [ -n "$FW_GUI" ] && ! global_bind "$FW_GUI" /root/gui; then
+      echo "runner: WARNING could not mount the update's GUI resources; $BM_ID uses the installed ones"
+    fi
+    [ -n "$FW_REV" ] && ! global_bind "$FW_REV" /root/pdj/app.rev && echo "runner: WARNING app.rev stays the installed one"
   fi
-  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}, $MOUNT_MODE)"
+  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}${FW_GUI:+, /root/gui = $FW_GUI}, $MOUNT_MODE)"
   (
     cd "$BM_DIR" 2>/dev/null || cd /tmp
     [ -n "$BM_CONF" ] && read_conf "$USB_RUN/$BM_CONF" "$BM_PREFIX" && echo "runner: $BM_CONF -> ${BM_PREFIX}*"
     export HOME="${DATA:-$STAGE}" BOOTMENU_STICK="$USB_RUN" BOOTMENU_APP_DIR="$BM_DIR" BOOTMENU_APP_ID="$BM_ID"
-    if [ -n "$DATA" ] && [ "$MOUNT_MODE" = ns ]; then
-      # shellcheck disable=SC2086
-      exec unshare -m sh -c 'mount -o bind "$1" /root/data || exit 97; shift; exec "$@"' sh "$DATA" "$APP_EXE" $BM_ARGS
+    if [ "$MOUNT_MODE" = ns ]; then
+      # the bind mounts as SRC DST pairs, then --, then the command: made in the app's own mount namespace
+      set --
+      [ -n "$DATA" ] && set -- "$@" "$DATA" /root/data
+      [ -n "$FW_GUI" ] && set -- "$@" "$FW_GUI" /root/gui
+      [ -n "$FW_REV" ] && set -- "$@" "$FW_REV" /root/pdj/app.rev
+      if [ $# -gt 0 ]; then
+        # shellcheck disable=SC2086
+        exec unshare -m sh -c 'while [ "$1" != -- ]; do mount -o bind "$1" "$2" || exit 97; shift 2; done; shift
+          exec "$@"' sh "$@" -- "$APP_EXE" $BM_ARGS
+      fi
     fi
     # shellcheck disable=SC2086
     exec "$APP_EXE" $BM_ARGS
@@ -371,7 +486,7 @@ run_menu() {
 
 load_choice() {
   BM_KIND=""; BM_ID=""; BM_NAME=""; BM_SOURCE=""; BM_EXE=""; BM_DIR=""; BM_ARGS=""; BM_DATA=""; BM_CONF=""
-  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""
+  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""; BM_VERSION=""
   . "$STAGE/choice.sh"
 }
 
@@ -464,7 +579,7 @@ while :; do
       [ -n "$FALLBACK" ] && [ -z "$MSG" ] && NEXT=official
       ;;
     official)
-      restore_official; NEXT=idle
+      free_firmware; restore_official; NEXT=idle
       ;;
     idle)
       sleep 1
@@ -475,6 +590,7 @@ done
 touch "$STAGE/runner.done"
 after_app
 restore_official   # first: the unit is usable again at once
+free_firmware
 stop_ssh
 rm -f "$STAGE/runner.pid" "$STAGE/state"
 echo "runner: session over"
