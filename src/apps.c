@@ -13,9 +13,14 @@
  * (EP085_Main_R) may be on the stick too, plain or encrypted, under any file name: recognised by content, it runs in
  * /root/pdj as the installed one does, with its settings on the stick (see official_build()).
  *
+ * Screen resources: a folder <id>-gui/ beside a program (or gui= in its settings) holds files for /root/gui, e.g. the
+ * Resource/skin16 images of a modified official application. The launcher lays them over a RAM copy of the unit's
+ * /root/gui and binds that over /root/gui while the program runs; the unit's own is never written.
+ *
  * Settings (.ini / app.ini, key=value, all optional):
  *   name=  description=  exe= (folder apps)  args=  data= (stick folder bound over /root/data; none = no redirect)
  *   conf= (stick file exported as <prefix><KEY>=value)  prefix=  run_from=ram|stick  accent=#rrggbb  hidden=1
+ *   gui= (folder of files for /root/gui, relative to the program's folder; none = not even <id>-gui/)
  * Defaults: data=<id>-data, conf=<id>.conf, prefix=<ID>_.
  *
  * An executable is compatible when it is a 32-bit little-endian ARM ELF executable (ET_EXEC, or ET_DYN with an
@@ -322,6 +327,10 @@ static void app_kv(void *user, const char *k, const char *v) {
     else if (!strcmp(k, "run_from")) copy(a->run_from, sizeof a->run_from, !strcmp(v, "stick") ? "stick" : "ram");
     else if (!strcmp(k, "accent") && *v == '#') a->accent = (uint32_t)strtoul(v + 1, NULL, 16) & 0xffffff;
     else if (!strcmp(k, "hidden")) x->hidden = atoi(v);
+    else if (!strcmp(k, "gui")) {
+        if (!strcmp(v, "none") || *v == '/') copy(a->gui, sizeof a->gui, v);
+        else snprintf(a->gui, sizeof a->gui, "%s/%s", a->dir, v);
+    }
 }
 
 /* The id of a file: its name without a trailing .bin / .elf / .app / .enc. */
@@ -382,7 +391,8 @@ static void finish_detail(App *a) {
     /* where it runs from, and whether it is encrypted, are the row's chips */
     char where[64];
     if (a->official_build)
-        snprintf(where, sizeof where, "Official SP-16 software %s", *a->version ? a->version : "(unknown version)");
+        snprintf(where, sizeof where, "Official SP-16 software %s%s", *a->version ? a->version : "(unknown version)",
+                 *a->gui ? " + own GUI" : "");
     else
         copy(where, sizeof where, a->source == SRC_STICK ? "On the USB stick" : "Inside autoexec.bin");
     if (*a->version && !a->official_build) snprintf(ver, sizeof ver, "v%s \xC2\xB7 ", a->version);
@@ -440,6 +450,16 @@ static void consider(AppList *l, AppSource src, const char *id, const char *dir,
         } else if (a->encrypted) {
             bm_log("apps: %s: encrypted program", a->exe);
         }
+        /* its own screen resources: gui= in its settings, else a folder <id>-gui beside it */
+        if (!*a->gui) {
+            char folder[320];
+            copy(folder, sizeof folder, a->exe);
+            char *slash = strrchr(folder, '/');
+            if (slash) *slash = 0;
+            snprintf(a->gui, sizeof a->gui, "%s/%s-gui", folder, a->id);
+        }
+        if (!strcmp(a->gui, "none") || stat(a->gui, &st) != 0 || !S_ISDIR(st.st_mode)) a->gui[0] = 0;
+        else bm_log("apps: %s: screen resources from %s", a->exe, a->gui);
     }
     finish_detail(a);
     l->n++;
@@ -490,7 +510,8 @@ static void scan_folders(AppList *l, const char *parent, AppSource src) {
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
+        size_t nlen = strlen(e->d_name);
+        if (e->d_name[0] == '.' || (nlen > 4 && !strcasecmp(e->d_name + nlen - 4, "-gui"))) continue; /* resources */
         char dir[320], ini[384], exe[384], pend[384];
         snprintf(dir, sizeof dir, "%s/%s", parent, e->d_name);
         struct stat st;
@@ -648,6 +669,7 @@ int apps_write_choice(const App *a, const char *path) {
     put(f, "BM_RUN_FROM", a->run_from);
     put(f, "BM_ENCRYPTED", a->encrypted ? "1" : "0");
     put(f, "BM_OFFICIAL_BUILD", a->official_build ? "1" : "0");
+    put(f, "BM_GUI", a->gui);
     snprintf(num, sizeof num, "%lld", a->size);
     put(f, "BM_SIZE", num);
     snprintf(num, sizeof num, "%ld", a->mtime);

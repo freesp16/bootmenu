@@ -38,6 +38,7 @@ enc() { python3 "$here/tools/encrypt-app.py" --key "$t/test.key" "$1" --out "$2"
 enc "$t/progs/demo" "$t/stick/secret.enc"               # an encrypted app with an app-info note
 cp "$t/progs/official" "$t/stick/EP085_Main_R"           # the official application, plain
 enc "$t/progs/official" "$t/stick/renamed_fw"            # ...and encrypted under another name
+mkdir -p "$t/stick/renamed_fw-gui/Resource" "$t/stick/apps/stray-gui"   # its screen resources; a -gui folder in apps/
 head -c 4096 /dev/urandom > "$t/stick/RANDOM.REC"        # not a program, whole sectors: must be ignored quietly
 echo "description=no app info" > "$t/stick/apps/plain/app.ini"
 echo "not a program" > "$t/stick/notes.txt"
@@ -65,8 +66,12 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$here":/work:ro -v "$t":/t "$imag
   check "it runs in /root/pdj" "^BM_DIR=./root/pdj.$" $t/fw.sh
   check "the choice says encrypted" "^BM_ENCRYPTED=.1.$" $t/fw.sh
   check "the choice says official application" "^BM_OFFICIAL_BUILD=.1.$" $t/fw.sh
+  check "its <name>-gui folder is its screen resources" "^BM_GUI=.$t/stick/renamed_fw-gui.$" $t/fw.sh
+  check "...and the row says so" "renamed_fw: screen resources from $t/stick/renamed_fw-gui" $t/log
+  if grep -q "stray-gui" $t/list $t/log; then echo "FAIL a -gui folder was taken for an app"; fail=1; else echo "PASS -gui folders are not apps"; fi
   run --stick $t/stick --key $t/test.key --resolve plain --out $t/plain.sh 2>/dev/null
   check "a plain app is not encrypted" "^BM_ENCRYPTED=.0.$" $t/plain.sh
+  check "an app without a -gui folder keeps the unit'"'"'s resources" "^BM_GUI=..$" $t/plain.sh
   run --key $t/test.key --decrypt $t/stick/renamed_fw > $t/dec 2>/dev/null
   n=$(wc -c < $t/progs/official)
   if head -c $n $t/dec | cmp -s - $t/progs/official; then echo "PASS the ARM build decrypts a program exactly"

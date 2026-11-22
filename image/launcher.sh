@@ -30,6 +30,8 @@
 #   bootmenu.last     the last choice (the menu's default)
 #   <id>-data/        an app's /root/data (the stick, never NAND); for the official application run from the stick, a
 #                     copy of the unit's own /root/data made the first time
+# Read from the stick:
+#   <id>-gui/         an app's own screen resources (files for /root/gui), laid over a RAM copy of the unit's
 #
 # Remote control (ssh root@169.254.16.16, then `ctl help`):
 #   ctl status | menu | run ID | start | official | stop | update [ID] < binary | list | log [N] | follow
@@ -268,7 +270,7 @@ stop_ssh() {
 }
 
 # --- Apps' /root/data off NAND -----------------------------------------------------------------------------------------
-# Preferred: a private mount namespace per launch, so only the app sees the swap. Otherwise a global bind mount
+# Preferred: a private mount namespace per launch, so only the app sees the swap. Otherwise global bind mounts
 # while the app runs, undone before the official app comes back.
 if command -v unshare >/dev/null 2>&1 && unshare -m sh -c 'mount -o bind /tmp /root/data' 2>/dev/null; then
   MOUNT_MODE=ns
@@ -276,14 +278,20 @@ else
   MOUNT_MODE=global
 fi
 echo "runner: /root/data redirect: $MOUNT_MODE"
-GLOBAL_MOUNT=""
+GLOBAL_MOUNTS=""
+
+# global_bind SRC DST: a bind mount that after_app undoes.
+global_bind() {
+  mount -o bind "$1" "$2" || return 1
+  GLOBAL_MOUNTS="$2 $GLOBAL_MOUNTS"
+}
 
 after_app() {
-  if [ -n "$GLOBAL_MOUNT" ]; then
-    umount /root/data 2>/dev/null || umount -l /root/data 2>/dev/null
-    GLOBAL_MOUNT=""
-    echo "runner: /root/data restored"
-  fi
+  for m in $GLOBAL_MOUNTS; do
+    umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+    echo "runner: $m restored"
+  done
+  GLOBAL_MOUNTS=""
 }
 
 # Stick apps run from a RAM disk of their own: the unit's /tmp is small (often under 10 MB free, less than the official
@@ -335,6 +343,33 @@ app_binary() {
   fi
 }
 
+# An app's own screen resources (<id>-gui/ on the stick, BM_GUI): the unit's /root/gui with the app's files laid over
+# it, in the RAM disk, so a folder may hold only what differs (e.g. a modified official application's new images).
+# Bound over /root/gui while the app runs; the unit's /root/gui is never written. Kept while the folder is unchanged.
+prepare_gui() {
+  APP_GUI=""
+  gui_dst="$STAGE/run/gui"
+  if [ -z "$BM_GUI" ] || [ ! -d "$BM_GUI" ]; then rm -rf "$gui_dst"; return 0; fi
+  run_ramdisk
+  gui_stamp=""
+  command -v cksum >/dev/null 2>&1 && gui_stamp="$BM_GUI $(ls -lR "$BM_GUI" 2>/dev/null | cksum)"
+  if [ -n "$gui_stamp" ] && [ -d "$gui_dst/root" ] && [ "$(cat "$gui_dst/.stamp" 2>/dev/null)" = "$gui_stamp" ]; then
+    APP_GUI="$gui_dst/root"; echo "runner: $BM_ID: screen resources in RAM are current"; return 0
+  fi
+  rm -rf "$gui_dst"
+  gui_t0=$(cut -d' ' -f1 /proc/uptime)
+  if mkdir -p "$gui_dst/root" && cp -R /root/gui/. "$gui_dst/root/" 2>/dev/null && cp -R "$BM_GUI/." "$gui_dst/root/"; then
+    echo "$gui_stamp" > "$gui_dst/.stamp"
+    APP_GUI="$gui_dst/root"
+    echo "runner: $BM_ID: screen resources: the unit's with $(find "$BM_GUI" -type f | wc -l) file(s) of $BM_GUI over" \
+      "them, in RAM ($(awk -v a="$gui_t0" '{ printf "%.1f", $1 - a }' /proc/uptime) s)"
+  else
+    rm -rf "$gui_dst"
+    APP_GUI="$BM_GUI"
+    echo "runner: $BM_ID: WARNING no room in RAM for the screen resources; $BM_GUI is used as it is (complete only if it holds every file)"
+  fi
+}
+
 # The official application from the stick starts with a copy of the unit's settings (calibration, last state), kept in
 # its own folder on the stick, so the installed software's settings never change.
 seed_official_data() {
@@ -347,6 +382,7 @@ seed_official_data() {
 # Starts the chosen app (choice.sh is sourced) in the background; APP_PID = its pid.
 launch_app() {
   app_binary || { echo "runner: ERROR $BM_ID could not be decrypted (no key on this unit, or no room)"; return 1; }
+  prepare_gui
   stop_official
   log_holders "before launching $BM_ID"
   DATA=""
@@ -360,22 +396,34 @@ launch_app() {
     fi
     [ "$BM_OFFICIAL_BUILD" = 1 ] && seed_official_data "$DATA"
   fi
-  if [ -n "$DATA" ] && [ "$MOUNT_MODE" = global ]; then
-    if mount -o bind "$DATA" /root/data; then GLOBAL_MOUNT=1
-    elif mount -t tmpfs -o size=16m tmpfs /root/data; then
-      GLOBAL_MOUNT=1; echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
-    else
-      echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
+  if [ "$MOUNT_MODE" = global ]; then
+    if [ -n "$DATA" ] && ! global_bind "$DATA" /root/data; then
+      if mount -t tmpfs -o size=16m tmpfs /root/data; then
+        GLOBAL_MOUNTS="/root/data $GLOBAL_MOUNTS"
+        echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
+      else
+        echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
+      fi
+    fi
+    if [ -n "$APP_GUI" ] && ! global_bind "$APP_GUI" /root/gui; then
+      echo "runner: WARNING could not mount its screen resources; $BM_ID uses the unit's"
     fi
   fi
-  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}, $MOUNT_MODE)"
+  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}${APP_GUI:+, /root/gui = $APP_GUI}, $MOUNT_MODE)"
   (
     cd "$BM_DIR" 2>/dev/null || cd /tmp
     [ -n "$BM_CONF" ] && read_conf "$USB_RUN/$BM_CONF" "$BM_PREFIX" && echo "runner: $BM_CONF -> ${BM_PREFIX}*"
     export HOME="${DATA:-$STAGE}" BOOTMENU_STICK="$USB_RUN" BOOTMENU_APP_DIR="$BM_DIR" BOOTMENU_APP_ID="$BM_ID"
-    if [ -n "$DATA" ] && [ "$MOUNT_MODE" = ns ]; then
-      # shellcheck disable=SC2086
-      exec unshare -m sh -c 'mount -o bind "$1" /root/data || exit 97; shift; exec "$@"' sh "$DATA" "$APP_EXE" $BM_ARGS
+    if [ "$MOUNT_MODE" = ns ]; then
+      # the bind mounts as SRC DST pairs, then --, then the command: made in the app's own mount namespace
+      set --
+      [ -n "$DATA" ] && set -- "$@" "$DATA" /root/data
+      [ -n "$APP_GUI" ] && set -- "$@" "$APP_GUI" /root/gui
+      if [ $# -gt 0 ]; then
+        # shellcheck disable=SC2086
+        exec unshare -m sh -c 'while [ "$1" != -- ]; do mount -o bind "$1" "$2" || exit 97; shift 2; done; shift
+          exec "$@"' sh "$@" -- "$APP_EXE" $BM_ARGS
+      fi
     fi
     # shellcheck disable=SC2086
     exec "$APP_EXE" $BM_ARGS
@@ -413,7 +461,7 @@ run_menu() {
 
 load_choice() {
   BM_KIND=""; BM_ID=""; BM_NAME=""; BM_SOURCE=""; BM_EXE=""; BM_DIR=""; BM_ARGS=""; BM_DATA=""; BM_CONF=""
-  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""; BM_ENCRYPTED=""; BM_OFFICIAL_BUILD=""
+  BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""; BM_ENCRYPTED=""; BM_OFFICIAL_BUILD=""; BM_GUI=""
   . "$STAGE/choice.sh"
 }
 

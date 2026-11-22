@@ -12,6 +12,9 @@ All notable changes to this project are listed here. The format follows
   decrypts one.
 - The official application (`EP085_Main_R`) on the stick, plain or encrypted and under any file name, is recognised
   by its content and runs as the installed one does (in `/root/pdj`), with a copy of the unit's settings on the stick.
+- A program's own screen resources: an `<id>-gui/` folder beside it (or `gui=`) is laid over a RAM copy of the
+  unit's `/root/gui` while it runs, so a modified official application shows its new images. `tools/extract-upd.py`
+  takes the application and its resources out of an update file.
 
 ### Changed
 - Programs from the stick run from a RAM disk of their own instead of `/tmp`, which is too small on the unit for

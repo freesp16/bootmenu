@@ -64,6 +64,7 @@ typedef struct {
     long icon_off;         /* file offset of the icon pixels */
     int encrypted;         /* 1 = the file is encrypted with the unit's key (crypt.c): the launcher decrypts it to RAM */
     int official_build;    /* 1 = the official SP-16 application (EP085_Main_R) under any file name: runs in /root/pdj */
+    char gui[320];         /* its own screen resources, laid over /root/gui while it runs ("" = none): <id>-gui/ */
 } App;
 
 typedef struct {

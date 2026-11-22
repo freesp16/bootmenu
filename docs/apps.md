@@ -40,12 +40,29 @@ with the unit's libraries and screen resources, while the installed copy stays u
 are `<stick>/<id>-data/`, a copy of the unit's own made the first time (calibration, preferences), so the installed
 software's settings never change; `data=none` in its `.ini` gives it the unit's own instead.
 
+A modified or newer application usually needs its own screen resources too: it loads its images and layouts from
+`/root/gui/Resource/skin16/`, and the unit only has those of the installed release. Put them in a folder
+`<id>-gui/` beside the program (the files as they go under `/root/gui`, e.g. `my163-gui/Resource/skin16/picture/...`).
+While the program runs, the menu lays that folder over a RAM copy of the unit's resources and mounts the result on
+`/root/gui`, so the folder may hold everything or only what differs; the unit's own resources are never written. The
+row then says *+ own GUI*. `gui=` in the `.ini` names another folder (`gui=none`: none at all). This works for any
+program, not only the official one.
+
+`tools/extract-upd.py` takes both out of an update file (`.UPD`) with the unit's key:
+
+```bash
+tools/extract-upd.py --key aes256.key TORAIZSP16_1.63.3.UPD --name my163 --out /path/to/stick
+# -> my163 (the application) and my163-gui/ (all its screen resources, about 2 MB)
+#    --encrypt: my163 encrypted with the key; --base OTHER.UPD: only the resources that differ from OTHER.UPD
+```
+
 ## How it runs
 
 The menu exits before the program starts, so the program gets the screen (`/dev/fb0`, or X on `:0`), the panel
 and the audio to itself, just as the official software has them. It runs as root, with:
 
 - its working directory set to its own folder (`/root/pdj` for the official application);
+- `/root/gui` with its own screen resources laid over the unit's, when it has an `<id>-gui/` folder;
 - `/root/data` mapped to `<stick>/<id>-data/` for the program alone, so nothing lands in internal memory;
 - the `key=value` lines of `<stick>/<id>.conf` as environment variables `<ID>_<KEY>`;
 - `BOOTMENU_STICK`, `BOOTMENU_APP_DIR` and `BOOTMENU_APP_ID` set.
@@ -65,6 +82,7 @@ prefix=MYAPP_
 run_from=ram           # ram (copied to /tmp first) or stick
 accent=#4f8cff
 hidden=1
+gui=my-resources       # files for /root/gui (default: <id>-gui/ when it exists; none = never)
 ```
 
 All keys are optional.

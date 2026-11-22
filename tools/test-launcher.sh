@@ -46,13 +46,21 @@ cat > "$work/fakefw.c" <<'C'
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+static void first_line(const char *path, char *out, size_t n) {
+    FILE *f = fopen(path, "r");
+    out[0] = 0;
+    if (f) { if (!fgets(out, (int)n, f)) out[0] = 0; fclose(f); }
+    out[strcspn(out, "\n")] = 0;
+}
 int main(int argc, char **argv) {
-    char cwd[256], dat[64] = "";
-    FILE *f = fopen("/root/data/Toraiz_SP16.dat", "r");
-    if (f) { if (!fgets(dat, sizeof dat, f)) dat[0] = 0; fclose(f); }
-    dat[strcspn(dat, "\n")] = 0;
-    printf("FAKEFW argv0=%s cwd=%s dat=%s\n", argv[0], getcwd(cwd, sizeof cwd), dat);
-    f = fopen("/root/data/written-by-fw", "w");
+    char cwd[256], dat[64], skin[64], base[64], added[64];
+    first_line("/root/data/Toraiz_SP16.dat", dat, sizeof dat);
+    first_line("/root/gui/Resource/skin.txt", skin, sizeof skin);
+    first_line("/root/gui/Resource/base.txt", base, sizeof base);
+    first_line("/root/gui/Resource/added.txt", added, sizeof added);
+    printf("FAKEFW argv0=%s cwd=%s dat=%s skin=%s base=%s added=%s\n", argv[0], getcwd(cwd, sizeof cwd), dat, skin,
+           base, added);
+    FILE *f = fopen("/root/data/written-by-fw", "w");
     if (f) fclose(f);
     fflush(stdout);
     sleep(2);
@@ -72,9 +80,11 @@ fail=0
 check() { if grep -q "$2" "$3"; then echo "PASS $1"; else echo "FAIL $1 (no '$2' in $3)"; fail=1; fi; }
 wait_for() { i=0; while ! grep -q "$1" "$2" 2>/dev/null && [ $i -lt ${3:-30} ]; do sleep 1; i=$((i+1)); done; }
 
-# the unit: a official app, its settings in /root/data
-mkdir -p /root/pdj /root/data
+# the unit: a official app, its settings in /root/data, its screen resources in /root/gui
+mkdir -p /root/pdj /root/data /root/gui/Resource
 echo "unit settings" > /root/data/Toraiz_SP16.dat
+echo "unit skin" > /root/gui/Resource/skin.txt
+echo "unit base" > /root/gui/Resource/base.txt
 printf '#!/bin/sh\ntrap "exit 0" TERM\nwhile :; do sleep 1; done\n' > /root/pdj/EP085_Main_R
 chmod 0755 /root/pdj/EP085_Main_R
 ( cd /root/pdj && ./EP085_Main_R & )
@@ -84,6 +94,9 @@ S=/vol/stick
 cp /work/apps/crashy $S/crashy
 cp /work/apps/secret.enc $S/secret.enc
 cp /work/apps/my_fw $S/my_fw
+mkdir -p $S/my_fw-gui/Resource         # only what differs: one changed file, one new one
+echo "mod skin" > $S/my_fw-gui/Resource/skin.txt
+echo "mod added" > $S/my_fw-gui/Resource/added.txt
 printf 'default=hello\ntimeout=3\nssh=0\n' > $S/bootmenu.conf
 printf 'greeting=hi there\n' > $S/hello.conf
 
@@ -131,6 +144,10 @@ sh $CTL run my_fw
 wait_for "runner: my_fw exited" $L 20
 check "it runs in /root/pdj from RAM" "FAKEFW argv0=/tmp/bootmenu/run/my_fw.bin cwd=/root/pdj" $L
 check "it starts with a copy of the unit's settings" "FAKEFW .* dat=unit settings" $L
+check "its -gui folder is laid over the unit's screen resources" "FAKEFW .* skin=mod skin base=unit base added=mod added" $L
+check "...in RAM" "my_fw: screen resources: the unit's with 2 file(s) of $S/my_fw-gui over them, in RAM" $L
+[ "$(cat /root/gui/Resource/skin.txt)" = "unit skin" ] && [ ! -e /root/gui/Resource/added.txt ] \
+  && echo "PASS the unit's /root/gui is untouched" || { echo "FAIL the unit's /root/gui changed"; fail=1; }
 [ -f $S/my_fw-data/written-by-fw ] && echo "PASS its settings stay on the stick" || { echo "FAIL no $S/my_fw-data/written-by-fw"; fail=1; }
 [ -f /root/data/written-by-fw ] && { echo "FAIL it wrote to the unit's /root/data"; fail=1; } || echo "PASS nothing written to the unit's /root/data"
 
