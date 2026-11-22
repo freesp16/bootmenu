@@ -57,6 +57,19 @@ LOG="${USB:-/tmp}/bootmenu.log"
     echo "autoexec.sh: a runner is already active (pid $old); not starting another"; exit 0
   fi
 
+  # How the previous session ended after its stick was pulled (that part of the log could only go to RAM).
+  if [ -s "$STAGE/end.log" ]; then
+    echo "--- the end of the previous session, after its stick was removed:"
+    cat "$STAGE/end.log"
+    echo "---"
+  fi
+  rm -f "$STAGE/end.log"
+  rmdir "$STAGE/restore.lock" 2>/dev/null
+  # Bind mounts a runner that died could not undo (each listed once, so never unmounted twice).
+  if [ -f "$STAGE/mounts" ]; then
+    while read -r m; do umount -l "$m" 2>/dev/null && echo "autoexec.sh: left-over mount $m undone"; done < "$STAGE/mounts"
+    rm -f "$STAGE/mounts"
+  fi
   rm -rf "$STAGE/apps" 2>/dev/null
   mkdir -p "$STAGE/bin" "$STAGE/apps" "$STAGE/run" 2>/dev/null
   rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" 2>/dev/null
@@ -272,27 +285,41 @@ stop_ssh() {
 # --- Apps' /root/data off NAND -----------------------------------------------------------------------------------------
 # Preferred: a private mount namespace per launch, so only the app sees the swap. Otherwise global bind mounts
 # while the app runs, undone before the official app comes back.
-if command -v unshare >/dev/null 2>&1 && unshare -m sh -c 'mount -o bind /tmp /root/data' 2>/dev/null; then
+if [ "${BOOTMENU_MOUNT_MODE:-}" = global ]; then
+  MOUNT_MODE=global # as on units without unshare (tools/test-launcher.sh uses it to test that path)
+elif command -v unshare >/dev/null 2>&1 && unshare -m sh -c 'mount -o bind /tmp /root/data' 2>/dev/null; then
   MOUNT_MODE=ns
 else
   MOUNT_MODE=global
 fi
 echo "runner: /root/data redirect: $MOUNT_MODE"
-GLOBAL_MOUNTS=""
-
-# global_bind SRC DST: a bind mount that after_app undoes.
+# global_bind SRC DST: a bind mount that after_app undoes. The list is a file, so the stick watcher can undo them too.
 global_bind() {
   mount -o bind "$1" "$2" || return 1
-  GLOBAL_MOUNTS="$2 $GLOBAL_MOUNTS"
+  echo "$2" >> "$STAGE/mounts"
 }
 
+# Undoes the global bind mounts, each exactly once: whoever renames the list first does it (the runner and the stick
+# watcher may both try). Unmounting /root/data twice would take the unit's own data partition off. Lazily once the
+# stick is gone, so nothing waits on a device that is not there.
 after_app() {
-  for m in $GLOBAL_MOUNTS; do
-    umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+  claim="$STAGE/mounts.$$"
+  mv "$STAGE/mounts" "$claim" 2>/dev/null || return 0
+  while read -r m; do
+    if [ -f "$STAGE/gone" ]; then umount -l "$m" 2>/dev/null; else umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null; fi
     echo "runner: $m restored"
-  done
-  GLOBAL_MOUNTS=""
+  done < "$claim"
+  rm -f "$claim"
 }
+
+# After the stick is pulled, the official software is started once, by whichever of the runner and the stick watcher
+# gets there first.
+restore_once() {
+  mkdir "$STAGE/restore.lock" 2>/dev/null || return 0
+  restore_official
+}
+
+now_s() { cut -d' ' -f1 /proc/uptime; }
 
 # Stick apps run from a RAM disk of their own: the unit's /tmp is small (often under 10 MB free, less than the official
 # application's 12 MB) but its RAM is not, and a program must not depend on the stick while it runs (the official
@@ -399,7 +426,7 @@ launch_app() {
   if [ "$MOUNT_MODE" = global ]; then
     if [ -n "$DATA" ] && ! global_bind "$DATA" /root/data; then
       if mount -t tmpfs -o size=16m tmpfs /root/data; then
-        GLOBAL_MOUNTS="/root/data $GLOBAL_MOUNTS"
+        echo /root/data >> "$STAGE/mounts"
         echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
       else
         echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
@@ -480,10 +507,28 @@ echo "runner: watching stick device ${DEV:-unknown}"
   tick=0
   while [ ! -f "$STAGE/runner.done" ]; do
     if { [ -n "$DEV" ] && [ ! -b "$DEV" ]; } || { [ -n "$DEV" ] && ! grep -q " $USB_RUN " /proc/mounts; }; then
-      echo "runner: stick removed, ending the session"
+      # The session ends here, whatever the runner is doing: stop the app or menu, undo the mounts, start the official
+      # software. The log goes to RAM (shown in bootmenu.log at the next insertion).
       touch "$STAGE/gone"
+      exec >>"$STAGE/end.log" 2>&1
+      echo "watcher: $(now_s) s: stick removed ($DEV), ending the session"
       p=$(cat "$STAGE/child.pid" 2>/dev/null)
-      if [ -n "$p" ]; then kill -TERM "$p" 2>/dev/null; sleep 3; kill -KILL "$p" 2>/dev/null; fi
+      if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        echo "watcher: stopping pid $p ($(cat "/proc/$p/comm" 2>/dev/null))"
+        kill -TERM "$p" 2>/dev/null
+        i=0; while kill -0 "$p" 2>/dev/null && [ $i -lt 3 ]; do sleep 1; i=$((i+1)); done
+        kill -KILL "$p" 2>/dev/null
+        i=0; while kill -0 "$p" 2>/dev/null && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done
+        if kill -0 "$p" 2>/dev/null; then
+          echo "watcher: pid $p is still there (state $(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null), wchan $(cat "/proc/$p/wchan" 2>/dev/null))"
+        else
+          echo "watcher: pid $p ended"
+        fi
+      fi
+      after_app
+      log_holders "before the official software comes back"
+      restore_once && echo "watcher: $(now_s) s: official software started (or already running)"
+      echo "watcher: done"
       exit 0
     fi
     tick=$((tick+1))
@@ -494,6 +539,7 @@ echo "runner: watching stick device ${DEV:-unknown}"
     sleep 1
   done
 ) &
+WATCHER_PID=$!
 
 # --- Supervisor --------------------------------------------------------------------------------------------------------
 # NEXT: menu (show it), run (resolve RUN_SPEC without the menu), app (run choice.sh), official, idle (wait for ctl).
@@ -563,8 +609,10 @@ while :; do
 done
 
 touch "$STAGE/runner.done"
+[ -f "$STAGE/gone" ] && exec >>"$STAGE/end.log" 2>&1 && echo "runner: $(now_s) s: the stick is gone"
 after_app
-restore_official   # first: the unit is usable again at once
+if [ -f "$STAGE/gone" ]; then restore_once; else restore_official; fi   # first: the unit is usable again at once
+[ -f "$STAGE/gone" ] && wait "$WATCHER_PID" 2>/dev/null   # its recovery steps end up in the log before this one
 stop_ssh
 rm -f "$STAGE/runner.pid" "$STAGE/state"
 echo "runner: session over"

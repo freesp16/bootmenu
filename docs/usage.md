@@ -34,7 +34,8 @@ official_wait_ms=8000
 
 - **An app quits:** the menu comes back.
 - **An app fails at once:** the menu comes back and says so; details are in `bootmenu.log`.
-- **The stick is pulled:** the app or the menu stops and the official software starts again.
+- **The stick is pulled:** the app or the menu stops and the official software starts again. What happened then
+  could not be written to the stick, so it is added to `bootmenu.log` the next time the stick goes in.
 - **The screen cannot be used:** the default entry starts without the menu (or the official software).
 
 ## Development images: SSH

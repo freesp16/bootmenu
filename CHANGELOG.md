@@ -16,7 +16,13 @@ All notable changes to this project are listed here. The format follows
   unit's `/root/gui` while it runs, so a modified official application shows its new images. `tools/extract-upd.py`
   takes the application and its resources out of an update file.
 
+### Fixed
+- Pulling the stick always brings back the official software: the stick watcher stops the program, undoes the mounts
+  and starts the official software itself, instead of waiting for the runner, which could stay stuck behind a program
+  that did not end. Each bind mount is undone exactly once.
+
 ### Changed
+- What happens after the stick is pulled is logged in RAM and added to `bootmenu.log` at the next insertion.
 - Programs from the stick run from a RAM disk of their own instead of `/tmp`, which is too small on the unit for
   larger programs (they ran from the stick instead).
 

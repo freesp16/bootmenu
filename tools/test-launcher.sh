@@ -7,7 +7,8 @@
 # `hello` (prints what the launcher gave it, then quits) and `crashy` (fails at once), and with a throwaway key in the
 # unit's key path, `secret` (hello encrypted) and `my_fw` (a stand-in for the official application, encrypted, under
 # another name). There is no GPU and no X here, so the menu takes its no-screen path: gl-fb fails, gl-x11 fails,
-# --fallback picks the default.
+# --fallback picks the default. The stick is a real mount with a device node, pulled at the end while the stand-in
+# official application runs; bind mounts are global, as on units without unshare.
 #
 #   tools/test-launcher.sh          needs Docker, the toolchain image (tools/build.sh builds it) and
 #                                   python3-cryptography; no host changes
@@ -44,6 +45,7 @@ printf 'int main(void) { return 3; }\n' > "$work/crashy.c"
 # The stand-in official application: where it runs and what /root/data holds for it.
 cat > "$work/fakefw.c" <<'C'
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 static void first_line(const char *path, char *out, size_t n) {
@@ -63,8 +65,8 @@ int main(int argc, char **argv) {
     FILE *f = fopen("/root/data/written-by-fw", "w");
     if (f) fclose(f);
     fflush(stdout);
-    sleep(2);
-    return argc > 99;
+    sleep(argc > 1 ? (unsigned)atoi(argv[1]) : 2);
+    return 0;
 }
 C
 echo "throwaway-test-key-not-for-any-unit" > "$work/test.key"
@@ -90,7 +92,10 @@ chmod 0755 /root/pdj/EP085_Main_R
 ( cd /root/pdj && ./EP085_Main_R & )
 sleep 1; pidof EP085_Main_R >/dev/null && echo "official app running"
 
-S=/vol/stick
+# the stick: a mount whose device node goes away when it is pulled, as on the unit
+S=/stick
+mkdir -p $S && mknod /dev/fakestick b 7 200 && mount -t tmpfs /dev/fakestick $S
+export BOOTMENU_MOUNT_MODE=global
 cp /work/apps/crashy $S/crashy
 cp /work/apps/secret.enc $S/secret.enc
 cp /work/apps/my_fw $S/my_fw
@@ -151,13 +156,40 @@ check "...in RAM" "my_fw: screen resources: the unit's with 2 file(s) of $S/my_f
 [ -f $S/my_fw-data/written-by-fw ] && echo "PASS its settings stay on the stick" || { echo "FAIL no $S/my_fw-data/written-by-fw"; fail=1; }
 [ -f /root/data/written-by-fw ] && { echo "FAIL it wrote to the unit's /root/data"; fail=1; } || echo "PASS nothing written to the unit's /root/data"
 
-echo "--- stick removed"
-mv $S /vol/gone 2>/dev/null; rm -f /tmp/bootmenu/runner.pid.keep
-# the watcher keys on the block device; here the stick is a folder, so end the session the way the watcher does
-touch /tmp/bootmenu/gone; p=$(cat /tmp/bootmenu/child.pid 2>/dev/null); [ -n "$p" ] && kill $p
-sleep 3
-grep -q "session over" /vol/gone/bootmenu.log && echo "PASS session ends" || { echo "FAIL session did not end"; fail=1; }
-echo "--- log"; cat /vol/gone/bootmenu.log
+grep -q " /root/data \| /root/gui " /proc/mounts && { echo "FAIL a bind mount was left after the app"; fail=1; } \
+  || echo "PASS the bind mounts are undone after each app"
+
+echo "--- the stick is pulled while the official application runs"
+echo "args=60" > $S/my_fw.ini
+n=$(grep -c "FAKEFW" $L)
+sh $CTL run my_fw
+i=0; while [ "$(grep -c FAKEFW $L)" -le "$n" ] && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
+grep -q " /root/gui " /proc/mounts && grep -q " /root/data " /proc/mounts \
+  && echo "PASS its resources and settings are bound (globally) while it runs" || { echo "FAIL not bound"; fail=1; }
+cp $L /work/vol/before-pull.log
+umount -l $S; rm -f /dev/fakestick
+E=/tmp/bootmenu/end.log
+wait_for "session over" $E 20
+check "the watcher sees the stick go" "watcher: .* stick removed (/dev/fakestick)" $E
+check "the application is stopped" "watcher: pid [0-9]* ended" $E
+pidof my_fw.bin >/dev/null && { echo "FAIL the application still runs"; fail=1; } || echo "PASS the application is gone"
+n=$(pidof EP085_Main_R | wc -w)
+[ "$n" = 1 ] && echo "PASS the official software runs again, once" || { echo "FAIL official instances: $n"; fail=1; }
+grep -q " /root/data \| /root/gui " /proc/mounts && { echo "FAIL a bind mount survived the pull"; grep root /proc/mounts; fail=1; } \
+  || echo "PASS the bind mounts are undone"
+[ "$(cat /root/data/Toraiz_SP16.dat)" = "unit settings" ] && [ "$(cat /root/gui/Resource/skin.txt)" = "unit skin" ] \
+  && echo "PASS the unit's own /root/data and /root/gui are back" || { echo "FAIL the unit's files are not back"; fail=1; }
+check "the session ends" "runner: session over" $E
+
+echo "--- the stick goes back in"
+mknod /dev/fakestick b 7 201 && mount -t tmpfs /dev/fakestick $S
+printf 'ssh=0\n' > $S/bootmenu.conf
+sh /work/iso/autoexec.sh $S
+wait_for "runner: menu exited" $S/bootmenu.log 20
+check "the new log shows how the last session ended" "the end of the previous session, after its stick was removed" $S/bootmenu.log
+check "...with its lines" "watcher: pid [0-9]* ended" $S/bootmenu.log
+echo "--- log (before the pull)"; cat /work/vol/before-pull.log
+echo "--- end of that session"; cat $E 2>/dev/null; sed -n '/the end of the previous session/,/^---$/p' $S/bootmenu.log
 exit $fail
 TEST
 
