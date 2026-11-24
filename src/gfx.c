@@ -11,6 +11,7 @@
  * atlas instead (radius < 0 marks them). The A9 only fills a few hundred 40-byte vertices a frame. */
 #include "bm.h"
 #include "gen/font_atlas.h"
+#include "soft.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -116,6 +117,7 @@ typedef struct {
 
 static struct {
     char backend[8];
+    int cpu; /* the CPU renderer (soft.c) instead of GL */
     int w, h;
     EGLDisplay dpy;
     EGLSurface surface;
@@ -185,6 +187,7 @@ static int egl_fail(char *err, size_t errlen, const char *what) {
 
 int gfx_load(const char *backend, char *err, size_t errlen) {
     snprintf(G.backend, sizeof G.backend, "%s", backend);
+    if (strcmp(backend, "cpu") == 0) return G.cpu = 1, 0; /* no driver: libX11 only, at gfx_open */
     void *e, *l;
     if (strcmp(backend, "host") == 0) {
         setenv("EGL_PLATFORM", "x11", 0); /* Mesa: the native display is an X11 Display* (a user value wins) */
@@ -252,6 +255,12 @@ static GLuint shader(GLenum type, const char *src, char *err, size_t errlen) {
 }
 
 int gfx_open(char *err, size_t errlen) {
+    if (G.cpu) {
+        if (soft_open(err, errlen) != 0) return -1;
+        G.w = 800, G.h = 480;
+        snprintf(G.info, sizeof G.info, "%s", soft_info());
+        return 0;
+    }
     void *native_display = NULL, *native_window = NULL;
     char fbline[128] = "";
     if (strcmp(G.backend, "fb") == 0) {
@@ -352,6 +361,10 @@ static void flush(void) {
 }
 
 void gfx_begin(uint32_t rgb) {
+    if (G.cpu) {
+        soft_begin(rgb);
+        return;
+    }
     G.n = 0;
     G.clip[2] = 0;
     glDisable(GL_SCISSOR_TEST);
@@ -360,6 +373,10 @@ void gfx_begin(uint32_t rgb) {
 }
 
 void gfx_clip(int x, int y, int w, int h) {
+    if (G.cpu) {
+        soft_clip(x, y, w, h);
+        return;
+    }
     flush();
     if (w <= 0) {
         glDisable(GL_SCISSOR_TEST);
@@ -383,6 +400,7 @@ static void use_texture(GLuint t) {
 }
 
 int gfx_image_create(const uint8_t *rgba, int w, int h) {
+    if (G.cpu) return soft_image_create(rgba, w, h);
     flush();
     GLuint t = 0;
     glGenTextures(1, &t);
@@ -401,6 +419,10 @@ int gfx_image_create(const uint8_t *rgba, int w, int h) {
 static Vertex *quad(void);
 void gfx_image(int tex, float x, float y, float w, float h, float alpha) {
     if (tex <= 0) return;
+    if (G.cpu) {
+        soft_image(tex, x, y, w, h, alpha);
+        return;
+    }
     use_texture((GLuint)tex);
     uint8_t c = (uint8_t)(alpha < 0 ? 0 : alpha > 1 ? 255 : alpha * 255 + 0.5f);
     const uint8_t col[4][4] = {{255, 255, 255, c}, {255, 255, 255, c}, {255, 255, 255, c}, {255, 255, 255, c}};
@@ -436,6 +458,10 @@ static void emit(Vertex *v, const float xy[4][2], const float uv[4][2], const ui
 static void rect4(float x, float y, float w, float h, float radius, uint32_t top, uint32_t bottom, float border,
                   float soft) {
     if (w <= 0 || h <= 0) return;
+    if (G.cpu) {
+        soft_rect(x, y, w, h, radius, top, bottom, border, soft);
+        return;
+    }
     float hw = w * 0.5f, hh = h * 0.5f;
     if (radius > hw) radius = hw;
     if (radius > hh) radius = hh;
@@ -508,7 +534,8 @@ float gfx_text(FontId f, float x, float y, uint32_t rgba, const char *s) {
             const float xy[4][2] = {{gx, gy}, {gx + g->w, gy}, {gx, gy + g->h}, {gx + g->w, gy + g->h}};
             float u0 = g->x * iw, v0 = g->y * ih, u1 = (g->x + g->w) * iw, v1 = (g->y + g->h) * ih;
             const float uv[4][2] = {{u0, v0}, {u1, v0}, {u0, v1}, {u1, v1}};
-            emit(quad(), xy, uv, col, 0, 0, -1, 0, 0);
+            if (G.cpu) soft_glyph(font_atlas, FONT_ATLAS_W, g->x, g->y, g->w, g->h, (int)gx, (int)gy, rgba);
+            else emit(quad(), xy, uv, col, 0, 0, -1, 0, 0);
         }
         pen += g->adv64 / 64.0f;
     }
@@ -556,6 +583,11 @@ static void write_shot(void) {
 }
 
 int gfx_end(void) {
+    if (G.cpu) {
+        int r = soft_end(G.shot);
+        G.shot[0] = 0;
+        return r;
+    }
     flush();
     if (G.shot[0]) write_shot();
     return eglSwapBuffers(G.dpy, G.surface) ? 0 : -1;

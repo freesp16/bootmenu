@@ -15,9 +15,11 @@ All notable changes to this project are listed here. The format follows
   a library loaded first (`preload=`), optionally only on one release (`needs_official=`) or build
   (`official_md5=`). A row that cannot start on the unit says why.
 - `env=` lines in an app's settings, with `${STICK}` and `${APP_DIR}`, and `BOOTMENU_UNIT` for every program.
+- A screen drawn by the CPU (`--render cpu`) when the GPU cannot draw the menu. On the DJS-1000
+  it comes right after the framebuffer, since the GPU's X11 window stays black there.
 
 ### Fixed
-- When the menu's X11 fallback crashes instead of failing, the default entry still starts without a screen.
+- When the menu's last screen fallback crashes instead of failing, the default entry still starts without a screen.
 
 ## [1.1.0] - 2026-11-24
 

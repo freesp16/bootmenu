@@ -16,7 +16,7 @@ choose what the unit runs: its official software, or community software from the
 - **Runs the official software from the stick.** A copy of the official application (`EP085_Main_R` or
   `EP113_Main_R`), under any file name and plain or encrypted, runs from the stick without replacing the installed one.
 - **Built for the hardware.** It starts while the official software is still shutting down and draws on the GPU,
-  so the menu is on screen quickly and reacts immediately to the SELECT encoder.
+  so the menu is on screen quickly and reacts immediately to the SELECT encoder. Without a working GPU it draws on the CPU instead.
 - **Remembers your choice.** The last app you started becomes the default and starts on its own after a short
   countdown.
 

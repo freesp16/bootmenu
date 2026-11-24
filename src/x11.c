@@ -1,11 +1,13 @@
-/* An X window for the gl-x11 fallback on the unit (an override-redirect 800x480 window over the official screen) and
+/* An X window for the gl-x11 and cpu renderers on the unit (an override-redirect 800x480 window over the screen) and
  * for the development window on a PC (--render host). libX11 is loaded with dlopen, so the fast fb path never maps
  * it and the binary has no DT_NEEDED on it. Keyboard: Up/Down or Left/Right = turn, Return/space = push,
  * Escape/BackSpace = back, F5/h = home (rescan), q = quit; a mouse click is a touch. */
+#define _GNU_SOURCE /* RTLD_DEFAULT */
 #include "bm.h"
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct _XDisplay Display;
@@ -57,10 +59,26 @@ static struct {
     int (*XConnectionNumber)(Display *);
     int (*XDisplayWidth)(Display *, int);
     int (*XDisplayHeight)(Display *, int);
+    /* the CPU renderer's frames (soft.c) */
+    void *(*XDefaultVisual)(Display *, int);
+    int (*XDefaultDepth)(Display *, int);
+    void *(*XCreateGC)(Display *, unsigned long, unsigned long, void *);
+    void *(*XCreateImage)(Display *, void *, unsigned, int, int, char *, unsigned, unsigned, int, int);
+    int (*XPutImage)(Display *, unsigned long, void *, void *, int, int, int, int, unsigned, unsigned);
+    void *gc, *image;
+    int depth, bpp;
+    uint8_t *frame;
     Display *dpy;
     Window win;
     int fullscreen, w, h;
 } X;
+
+/* A function as the program's own link would find it: the global scope first (where an LD_PRELOAD library comes before
+ * libX11), else libX11 itself. */
+static void *x_sym(void *lib, const char *name) {
+    void *f = dlsym(RTLD_DEFAULT, name);
+    return f ? f : dlsym(lib, name);
+}
 
 int x11_open(int w, int h, int fullscreen, char *err, size_t errlen) {
     void *lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
@@ -69,13 +87,13 @@ int x11_open(int w, int h, int fullscreen, char *err, size_t errlen) {
         return -1;
     }
 #define SYM(name)                                                                  \
-    if (!(*(void **)(&X.name) = dlsym(lib, #name))) {                              \
+    if (!(*(void **)(&X.name) = x_sym(lib, #name))) {                              \
         snprintf(err, errlen, "libX11 lacks %s", #name);                           \
         return -1;                                                                 \
     }
     SYM(XOpenDisplay) SYM(XDefaultScreen) SYM(XRootWindow) SYM(XCreateWindow) SYM(XMapRaised) SYM(XStoreName)
     SYM(XPending) SYM(XNextEvent) SYM(XLookupKeysym) SYM(XFlush) SYM(XConnectionNumber) SYM(XDisplayWidth)
-    SYM(XDisplayHeight)
+    SYM(XDisplayHeight) SYM(XDefaultVisual) SYM(XDefaultDepth) SYM(XCreateGC) SYM(XCreateImage) SYM(XPutImage)
 #undef SYM
     X.dpy = X.XOpenDisplay(NULL); /* $DISPLAY; the launcher sets :0 on the unit */
     if (!X.dpy) {
@@ -132,4 +150,51 @@ int x11_poll(InputEvent *out, int max, int *quit) {
         if (e.kind != IN_NONE) out[n++] = e;
     }
     return n;
+}
+
+/* ---- the CPU renderer's frames ------------------------------------------------------------------------------------
+ * The start of Xlib's XImage (its layout is fixed by the Xlib ABI): the fields read back after XCreateImage. */
+typedef struct {
+    int width, height, xoffset, format;
+    char *data;
+    int byte_order, bitmap_unit, bitmap_bit_order, bitmap_pad, depth, bytes_per_line, bits_per_pixel;
+} XImageHead;
+
+int x11_present_prepare(int w, int h, char *how, size_t howlen) {
+    if (!X.dpy) return snprintf(how, howlen, "no X display"), -1;
+    int screen = X.XDefaultScreen(X.dpy);
+    X.depth = X.XDefaultDepth(X.dpy, screen);
+    if (X.depth != 16 && X.depth != 24 && X.depth != 32)
+        return snprintf(how, howlen, "X depth %d not supported", X.depth), -1;
+    X.bpp = X.depth == 16 ? 2 : 4;
+    X.frame = calloc((size_t)w * (size_t)h, (size_t)X.bpp);
+    X.gc = X.XCreateGC(X.dpy, X.win, 0, NULL);
+    X.image = X.frame ? X.XCreateImage(X.dpy, X.XDefaultVisual(X.dpy, screen), (unsigned)X.depth, 2 /*ZPixmap*/, 0,
+                                       (char *)X.frame, (unsigned)w, (unsigned)h, 32, w * X.bpp)
+                      : NULL;
+    if (!X.image || !X.gc) return snprintf(how, howlen, "XCreateImage failed"), -1;
+    const XImageHead *im = X.image;
+    if (im->bits_per_pixel != X.bpp * 8 || im->bytes_per_line != w * X.bpp)
+        return snprintf(how, howlen, "X image %d bpp, %d bytes a line: not as expected", im->bits_per_pixel,
+                        im->bytes_per_line), -1;
+    snprintf(how, howlen, "XPutImage depth %d (%s)", X.depth, X.depth == 16 ? "RGB565" : "XRGB8888");
+    return 0;
+}
+
+/* One frame of 0x00RRGGBB words, converted to the server's format. */
+int x11_present(const uint32_t *px, int w, int h) {
+    if (!X.image) return -1;
+    size_t n = (size_t)w * (size_t)h;
+    if (X.bpp == 2) {
+        uint16_t *d = (uint16_t *)X.frame;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t c = px[i];
+            d[i] = (uint16_t)((c >> 8 & 0xf800) | (c >> 5 & 0x07e0) | (c >> 3 & 0x001f));
+        }
+    } else {
+        memcpy(X.frame, px, n * 4);
+    }
+    X.XPutImage(X.dpy, X.win, X.gc, X.image, 0, 0, 0, 0, (unsigned)w, (unsigned)h);
+    X.XFlush(X.dpy);
+    return 0;
 }

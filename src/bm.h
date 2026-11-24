@@ -172,8 +172,8 @@ void panel_request_standby(void);            /* DJS-1000: asks the panel to put 
 /* ---- graphics (gfx.c) ----------------------------------------------------------------------------------------- */
 typedef enum { FONT_TITLE, FONT_NAME, FONT_BODY, FONT_HINT, FONT_CHIP, FONT_ICON, FONT_SPLASH, FONT_HERO } FontId;
 
-/* "fb" (Vivante, straight to /dev/fb0), "x11" (Vivante into an X window), "host" (Mesa libEGL/libGLESv2 + X11,
- * development only). gfx_load only loads the libraries (safe while the official app still runs); gfx_open makes the
+/* "fb" (Vivante, straight to /dev/fb0), "x11" (Vivante into an X window), "cpu" (drawn by the CPU into an X window:
+ * soft.c, no GPU needed), "host" (Mesa libEGL/libGLESv2 + X11, development only). gfx_load only loads the libraries (safe while the official app still runs); gfx_open makes the
  * window, context, shaders and the atlas texture. */
 int gfx_load(const char *backend, char *err, size_t errlen);
 int gfx_open(char *err, size_t errlen);
@@ -207,6 +207,9 @@ void *x11_display(void);
 unsigned long x11_window(void);
 int x11_fd(void);
 int x11_poll(InputEvent *out, int max, int *quit); /* keyboard: arrows = turn, Return = push, Escape = back */
+/* The CPU renderer's frames (soft.c): an image in the server's format, put on the window. */
+int x11_present_prepare(int w, int h, char *how, size_t howlen);
+int x11_present(const uint32_t *px, int w, int h);
 
 /* ---- menu (ui.c) ---------------------------------------------------------------------------------------------- */
 typedef struct Menu Menu;

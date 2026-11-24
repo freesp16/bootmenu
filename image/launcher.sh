@@ -592,33 +592,43 @@ launch_app() {
   return 0
 }
 
-# Runs the menu; on success choice.sh holds the choice. fb first; if that fails or crashes, x11, which falls back to
-# the default entry (or the official software) by itself when it cannot draw either.
+# Runs the menu; on success choice.sh holds the choice. The renderers in turn, each tried when the one before failed
+# or crashed: gl-fb (the GPU straight to the framebuffer), gl-x11 (the GPU into an X window; not on the DJS-1000, where
+# its window stays black), cpu (drawn by the CPU into an X window: no GPU needed). The last one
+# tried falls back to the default entry (or the official software) by itself when it cannot draw either.
+menu_try() { # RENDER [--fallback]: sets rc
+  "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" --render "$@" \
+    ${MSG:+--message "$MSG"} </dev/null &
+  echo $! > "$STAGE/child.pid"; wait $!; rc=$?
+  rm -f "$STAGE/child.pid"
+  [ $rc -eq 6 ] && echo "runner: menu: the stick was pulled" && touch "$STAGE/gone"
+  return 0
+}
+menu_failed() { # the renderer could not draw (2) or crashed, and nothing else happened
+  [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] && { [ $rc -eq 2 ] || [ $rc -ge 128 ]; }
+}
 run_menu() {
   rm -f "$STAGE/choice.sh"
   echo "runner: menu${MSG:+ (message: $MSG)}"
   FALLBACK=""
-  "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" \
-    ${MSG:+--message "$MSG"} </dev/null &
-  echo $! > "$STAGE/child.pid"; wait $!; rc=$?
-  rm -f "$STAGE/child.pid"
-  if [ $rc -eq 6 ]; then
-    echo "runner: menu: the stick was pulled"; touch "$STAGE/gone"
-  fi
-  if [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] \
-     && { [ $rc -eq 2 ] || [ $rc -ge 128 ]; }; then
+  menu_try fb
+  last=fb
+  if menu_failed && [ "$UNIT_KEY" != djs1000 ]; then
     echo "runner: menu: gl-fb failed (rc=$rc); trying gl-x11"
-    "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" --render x11 \
-      --fallback ${MSG:+--message "$MSG"} </dev/null &
-    echo $! > "$STAGE/child.pid"; wait $!; rc=$?
-    rm -f "$STAGE/child.pid"
+    menu_try x11
+    last=x11
+  fi
+  if menu_failed; then
+    echo "runner: menu: gl-$last failed (rc=$rc); trying cpu"
+    menu_try cpu --fallback
     [ $rc -eq 3 ] && FALLBACK=1 && echo "runner: menu: no screen; the default entry was chosen without it"
-    # gl-x11 crashed instead of failing: choose as --fallback would have (after a failed start, the official software)
+    # the cpu renderer crashed instead of failing: choose as --fallback would have (after a failed start, the
+    # official software)
     if [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] && [ $rc -ge 128 ]; then
       spec=default; [ -n "$MSG" ] && spec=official
       if "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" \
            --resolve "$spec" </dev/null; then
-        FALLBACK=1; echo "runner: menu: gl-x11 crashed (rc=$rc); no screen, the $spec entry was chosen without it"
+        FALLBACK=1; echo "runner: menu: cpu crashed (rc=$rc); no screen, the $spec entry was chosen without it"
       fi
     fi
   fi
@@ -635,7 +645,7 @@ load_choice() {
 }
 
 # --- Bring-up ----------------------------------------------------------------------------------------------------------
-DISPLAY=${DISPLAY:-:0}   # the boot scripts never export it; the X server (Xfbdev) is :0 (used by gl-x11 only)
+DISPLAY=${DISPLAY:-:0}   # the boot scripts never export it; the X server (Xfbdev) is :0 (gl-x11 and cpu)
 export DISPLAY
 cd "$STAGE" 2>/dev/null || cd /tmp
 
