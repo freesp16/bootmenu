@@ -6,6 +6,8 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-24
+
 ### Added
 - Programs encrypted with the unit's key (the cipher of `autoexec.bin`) are listed under their file name with an
   ENCRYPTED label and decrypted into RAM when started; `tools/encrypt-app.py` makes them, `bootmenu --decrypt`
