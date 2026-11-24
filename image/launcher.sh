@@ -146,6 +146,8 @@ stop_official() {
   done
   killall -KILL EP085_Main_R 2>/dev/null || kill -KILL $(official_pids) 2>/dev/null
   sleep 1
+  # its screen saver may have dimmed the LCD; only the official app would brighten it again
+  "$STAGE/bin/bootmenu" --wake-backlight || true
 }
 
 # Diagnostics: every process holding the panel (/dev/subucom_spi0.1) or the strip (/dev/cdc_spi2.0).

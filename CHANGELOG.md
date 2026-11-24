@@ -20,6 +20,9 @@ All notable changes to this project are listed here. The format follows
 - Pulling the stick always brings back the official software: the stick watcher stops the program, undoes the mounts
   and starts the official software itself, instead of waiting for the runner, which could stay stuck behind a program
   that did not end. Each bind mount is undone exactly once.
+- The screen is bright again when the menu starts after the official software's screen saver dimmed it: once the
+  official software is gone, the menu sets the backlight to its LCD BRIGHTNESS setting, as the official software
+  does when it starts. Apps started with `ctl run` get the same (`bootmenu --wake-backlight`).
 
 ### Changed
 - What happens after the stick is pulled is logged in RAM and added to `bootmenu.log` at the next insertion.

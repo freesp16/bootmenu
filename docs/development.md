@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| `src/` | the menu, C99: start-up and loop (`main.c`), OpenGL ES (`gfx.c`), the screen (`ui.c`), app discovery (`apps.c`), encrypted programs (`crypt.c`), panel input (`panel.c`) |
+| `src/` | the menu, C99: start-up and loop (`main.c`), OpenGL ES (`gfx.c`), the screen (`ui.c`), app discovery (`apps.c`), encrypted programs (`crypt.c`), panel input (`panel.c`), the LCD backlight (`backlight.c`) |
 | `image/` | the scripts inside `autoexec.bin`: `autoexec.sh` (logs, then runs `launcher.sh`) and `launcher.sh` (runs the menu, then the chosen app) |
 | `toolchain/` | the build container: Debian's armel cross GCC with a glibc 2.13 sysroot |
 | `tools/` | build, image, tests |

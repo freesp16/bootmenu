@@ -106,6 +106,18 @@ int official_signal(int sig);                  /* signals every live EP085_Main_
 int official_running(void);
 int official_wait_gone(int timeout_ms);        /* 1 when gone within the timeout */
 
+/* ---- LCD backlight (backlight.c) ----------------------------------------------------------------------------- */
+#ifndef BM_BACKLIGHT
+#define BM_BACKLIGHT "/dev/backlight"
+#endif
+#ifndef BM_SETTINGS
+#define BM_SETTINGS "/root/data/Toraiz_SP16.dat" /* the official application's settings */
+#endif
+int backlight_setting(const char *settings); /* its LCD BRIGHTNESS, 1..5 (3 when unreadable) */
+int backlight_level(int step);               /* 1..5 -> the driver's level, as the official application maps it */
+/* Sets the backlight to the official application's LCD BRIGHTNESS (undoes its screen saver); 0 on success. */
+int backlight_wake(const char *settings, char *info, size_t infolen);
+
 /* ---- panel link (panel.c) ------------------------------------------------------------------------------------- */
 typedef enum { IN_NONE, IN_TURN, IN_PUSH, IN_BACK, IN_HOME, IN_TOUCH_DOWN, IN_TOUCH_UP } InputKind;
 typedef struct {

@@ -43,6 +43,13 @@ head -c 4096 /dev/urandom > "$t/stick/RANDOM.REC"        # not a program, whole 
 echo "description=no app info" > "$t/stick/apps/plain/app.ini"
 echo "not a program" > "$t/stick/notes.txt"
 echo "default=demo" > "$t/stick/bootmenu.conf"
+# the official application's settings file (header, then 0x8c-byte records: id at +0, value at +0x88): LCD BRIGHTNESS
+# (id 5) at 5, and a copy with it out of range
+settings() { python3 -c 'import struct, sys
+rec = lambda i, v: struct.pack("<i", i) + bytes(0x84) + struct.pack("<i", v)
+open(sys.argv[1], "wb").write(bytes.fromhex("8f9e7b2a04000100") + rec(3, 2) + rec(5, int(sys.argv[2])) + rec(6, 32))' "$@"; }
+settings "$t/settings.dat" 5
+settings "$t/settings-bad.dat" 9
 
 # 3) the tests
 docker run --rm --user "$(id -u):$(id -g)" -v "$here":/work:ro -v "$t":/t "$image" sh -eu -c '
@@ -86,6 +93,13 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$here":/work:ro -v "$t":/t "$imag
   check "--resolve default writes the configured default" "^BM_ID=.demo.$" $t/choice.sh
   run --stick $t/stick --resolve stock --out $t/choice2.sh 2>/dev/null
   check "the old name stock still resolves to the official software" "^BM_KIND=.official.$" $t/choice2.sh
+  rc=0; run --wake-backlight --settings $t/settings.dat 2> $t/bl || rc=$?
+  check "the backlight follows the official LCD BRIGHTNESS" "LCD BRIGHTNESS 5 -> level 248" $t/bl
+  [ $rc -eq 8 ] && echo "PASS --wake-backlight without /dev/backlight fails" || { echo "FAIL --wake-backlight: rc=$rc"; fail=1; }
+  run --wake-backlight --settings $t/settings-bad.dat 2> $t/bl2 || true
+  check "an out-of-range LCD BRIGHTNESS means the default" "LCD BRIGHTNESS 3 -> level 91" $t/bl2
+  run --wake-backlight --settings $t/missing.dat 2> $t/bl3 || true
+  check "no settings file means the default" "LCD BRIGHTNESS 3 -> level 91" $t/bl3
   run --version > $t/version
   check "--version prints the build version" "^bootmenu [0-9]" $t/version
   exit $fail'

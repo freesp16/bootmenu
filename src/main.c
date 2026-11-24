@@ -4,12 +4,14 @@
  *   bootmenu --stick DIR [--embedded DIR] --resolve SPEC|default [--out FILE]    (no screen: write a choice)
  *   bootmenu --stick DIR [--embedded DIR] --list
  *   bootmenu --decrypt FILE [--key KEYFILE]           (an encrypted program, decrypted, on stdout)
+ *   bootmenu --wake-backlight [--settings FILE]       (the LCD back to the official app's brightness, then exit)
  *
  * Start-up order (every step logged with its time, "BOOTMENU <ms> ..."):
  *   1. SIGTERM to the official app            it shuts down while we do 2 and 3
  *   2. load the GL driver (dlopen)         no display access yet
  *   3. scan the stick and the image        reads directory entries and 52-byte ELF headers only
- *   4. wait until the official app is gone    SIGKILL after official_wait_ms
+ *   4. wait until the official app is gone    SIGKILL after official_wait_ms; then the backlight (its screen
+ *                                             saver may have dimmed it, and only it would undo that)
  *   5. EGL window + context, shader, atlas
  *   6. the panel link
  *   7. first frame
@@ -17,7 +19,8 @@
  * Exit codes: 0 a choice was written to --out; 2 graphics failed (the launcher runs us again with --render x11
  * --fallback); 3 graphics failed and --fallback wrote the default (or official) choice; 4 nothing could be chosen;
  * 5 stopped by a signal or q (no choice); 6 the stick was pulled (the launcher starts the official app at once); 1 usage;
- * 7 --decrypt failed. --key: the unit's key file for encrypted programs (default BM_KEY). */
+ * 7 --decrypt failed; 8 --wake-backlight could not set the backlight. --key: the unit's key file for encrypted programs
+ * (default BM_KEY). --settings: the official app's settings file, for its LCD BRIGHTNESS (default BM_SETTINGS). */
 #define _GNU_SOURCE
 #include "bm.h"
 
@@ -97,13 +100,14 @@ static void usage(void) {
             "       bootmenu --stick DIR [--embedded DIR] --resolve SPEC|default [--out FILE]\n"
             "       bootmenu --stick DIR [--embedded DIR] --list\n"
             "       bootmenu --decrypt FILE [--key KEYFILE]\n"
+            "       bootmenu --wake-backlight [--settings FILE]\n"
             "       bootmenu --version\n");
 }
 
 typedef struct {
     Config cfg;
-    const char *conf, *out, *render, *message, *resolve, *shot, *keys, *decrypt;
-    int fallback, list, no_official_stop, exit_after;
+    const char *conf, *out, *render, *message, *resolve, *shot, *keys, *decrypt, *settings;
+    int fallback, list, no_official_stop, exit_after, wake_backlight;
 } Args;
 
 static int parse(Args *a, int argc, char **argv) {
@@ -111,6 +115,7 @@ static int parse(Args *a, int argc, char **argv) {
     config_defaults(&a->cfg);
     a->out = "/tmp/bootmenu/choice.sh";
     a->render = "fb";
+    a->settings = BM_SETTINGS;
     for (int i = 1; i < argc; i++) {
         const char *k = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
 #define VAL(dst) if (!v) return -1; dst = v; i++; continue;
@@ -124,11 +129,13 @@ static int parse(Args *a, int argc, char **argv) {
         if (!strcmp(k, "--screenshot")) { VAL(a->shot) }
         if (!strcmp(k, "--keys")) { VAL(a->keys) }
         if (!strcmp(k, "--decrypt")) { VAL(a->decrypt) }
+        if (!strcmp(k, "--settings")) { VAL(a->settings) }
         if (!strcmp(k, "--key")) { if (!v) return -1; snprintf(a->cfg.key, sizeof a->cfg.key, "%s", v); i++; continue; }
         if (!strcmp(k, "--exit-after")) { if (!v) return -1; a->exit_after = atoi(v); i++; continue; }
         if (!strcmp(k, "--fallback")) { a->fallback = 1; continue; }
         if (!strcmp(k, "--list")) { a->list = 1; continue; }
         if (!strcmp(k, "--no-official-stop")) { a->no_official_stop = 1; continue; }
+        if (!strcmp(k, "--wake-backlight")) { a->wake_backlight = 1; continue; }
         if (!strcmp(k, "--help") || !strcmp(k, "-h")) return -1;
         if (!strcmp(k, "--version")) {
             printf("bootmenu %s\n", BM_VERSION);
@@ -160,6 +167,18 @@ static void stop_official(const Args *a) {
     bm_log("official: %s", official_wait_gone(2000) ? "gone after SIGKILL" : "WARNING still there");
 }
 
+/* Once the official app is gone (never while it runs: the backlight is its own then). */
+static int restore_backlight(const Args *a) {
+    char info[200];
+    if (official_running()) {
+        bm_log("backlight: left to the official app, still running");
+        return -1;
+    }
+    int rc = backlight_wake(a->settings, info, sizeof info);
+    bm_log("%s", info);
+    return rc;
+}
+
 /* --keys "dddp" scripts the menu for screenshots and tests: d/u = turn, p = push, b = back, h = home, one key every
  * 150 ms from 0.8 s on; '.' waits one step. */
 static int scripted(const char *keys, double age, int *next, InputEvent *e) {
@@ -189,6 +208,8 @@ int main(int argc, char **argv) {
         if (!crypt_key_load(a.cfg.key)) return 7;
         return crypt_decrypt_file(a.decrypt, STDOUT_FILENO) == 0 ? 0 : 7;
     }
+    /* The launcher's path without the menu (ctl run): the official app was stopped by the launcher. */
+    if (a.wake_backlight) return restore_backlight(&a) == 0 ? 0 : 8;
     char conf[320];
     if (a.conf) snprintf(conf, sizeof conf, "%s", a.conf);
     else snprintf(conf, sizeof conf, "%s/bootmenu.conf", a.cfg.stick);
@@ -232,6 +253,7 @@ int main(int argc, char **argv) {
 
     /* 4. */
     stop_official(&a);
+    restore_backlight(&a);
     if (stick_gone()) {
         bm_log("stick: removed during start-up; exit for the official app");
         return 6;
