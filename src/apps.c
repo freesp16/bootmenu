@@ -9,9 +9,13 @@
  *  official                                     the unit's own application (the launcher restarts it)
  *
  * Any of the stick's programs may be encrypted with the unit's key (crypt.c): recognised by content, listed under its
- * file name like a plain one, decrypted into RAM by the launcher at start. The official application itself
- * (EP085_Main_R) may be on the stick too, plain or encrypted, under any file name: recognised by content, it runs in
- * /root/pdj as the installed one does, with its settings on the stick (see official_build()).
+ * file name like a plain one, decrypted into RAM by the launcher at start. An official application itself
+ * (EP085_Main_R or EP113_Main_R) may be on the stick too, plain or encrypted, under any file name: recognised by
+ * content, it runs in /root/pdj as the installed one does, with its settings on the stick (see official_build()). One
+ * made for the other unit (known by its release) is listed but cannot start.
+ *
+ * A folder app may also run the unit's installed official application with a library preloaded into it: a mod of the
+ * official software that is not a modified copy of it (exe=official, preload=, see consider_official()).
  *
  * Screen resources: a folder <id>-gui/ beside a program (or gui= in its settings) holds files for /root/gui, e.g. the
  * Resource/skin16 images of a modified official application. The launcher lays them over a RAM copy of the unit's
@@ -21,7 +25,9 @@
  *   name=  description=  exe= (folder apps)  args=  data= (stick folder bound over /root/data; none = no redirect)
  *   conf= (stick file exported as <prefix><KEY>=value)  prefix=  run_from=ram|stick  accent=#rrggbb  hidden=1
  *   gui= (folder of files for /root/gui, relative to the program's folder; none = not even <id>-gui/)
- * Defaults: data=<id>-data, conf=<id>.conf, prefix=<ID>_.
+ *   exe=official  preload= (a library, relative to the folder)  env=KEY=value (repeatable, ${STICK} ${APP_DIR})
+ *   official_md5= (only that exact official application)  needs_official= (the release it needs, e.g. 1.22)
+ * Defaults: data=<id>-data (none with exe=official), conf=<id>.conf, prefix=<ID>_.
  *
  * An executable is compatible when it is a 32-bit little-endian ARM ELF executable (ET_EXEC, or ET_DYN with an
  * interpreter), EABI, soft-float calling convention (the unit's glibc is armel). */
@@ -221,21 +227,17 @@ int apps_load_icon(const App *a, uint8_t *dst) {
     return r == (ssize_t)n ? 0 : -1;
 }
 
-/* The official application's size for each official release (PioneerSP16FirmwareResearch/docs/firmware-reference.md,
- * "Application binary identities"). The sizes are all different, so one stat() tells the installed version; a
- * SHA-256 of the 12 MB file would cost a noticeable part of a second on the A9 at every start. */
-static const struct {
-    long long bytes;
-    const char *version;
-} OFFICIAL_RELEASES[] = {
-    {10724172, "1.20"}, {11172172, "1.30"}, {11171172, "1.31"},
-    {11676132, "1.40"}, {11993612, "1.50"}, {12000396, "1.60"},
-};
+/* The release of an official application, from its size (unit.c): a SHA-256 of the 12 MB file would cost a
+ * noticeable part of a second on the A9 at every start. *model gets the unit it was made for (NULL if unknown). */
+static const char *release_for_size(long long bytes, const Unit **model) { return unit_release(bytes, model); }
 
-static const char *release_for_size(long long bytes) {
-    for (size_t i = 0; i < sizeof OFFICIAL_RELEASES / sizeof OFFICIAL_RELEASES[0]; i++)
-        if (OFFICIAL_RELEASES[i].bytes == bytes) return OFFICIAL_RELEASES[i].version;
-    return NULL;
+/* The installed official application's release on this unit ("" if unknown, NULL if it is not installed). */
+static const char *installed_release(void) {
+    struct stat st;
+    if (stat(unit()->official_exe, &st) != 0) return NULL;
+    const Unit *u;
+    const char *v = release_for_size((long long)st.st_size, &u);
+    return v && u == unit() ? v : "";
 }
 
 /* ---- the official application under another name -------------------------------------------------------------
@@ -309,7 +311,7 @@ static uint32_t accent_for(const char *id) {
 
 typedef struct {
     App *a;
-    int hidden;
+    int hidden, data_set;
 } IniCtx;
 
 static void app_kv(void *user, const char *k, const char *v) {
@@ -318,10 +320,19 @@ static void app_kv(void *user, const char *k, const char *v) {
     if (!strcmp(k, "name")) copy(a->name, sizeof a->name, v);
     else if (!strcmp(k, "description")) copy(a->desc, sizeof a->desc, v);
     else if (!strcmp(k, "exe")) {
-        if (*v == '/') copy(a->exe, sizeof a->exe, v);
+        a->as_official = !strcmp(v, "official");
+        if (a->as_official) copy(a->exe, sizeof a->exe, unit()->official_exe);
+        else if (*v == '/') copy(a->exe, sizeof a->exe, v);
         else snprintf(a->exe, sizeof a->exe, "%s/%s", a->dir, v);
-    } else if (!strcmp(k, "args")) copy(a->args, sizeof a->args, v);
-    else if (!strcmp(k, "data")) copy(a->data, sizeof a->data, v);
+    } else if (!strcmp(k, "preload")) {
+        if (*v == '/') copy(a->preload, sizeof a->preload, v);
+        else snprintf(a->preload, sizeof a->preload, "%s/%s", a->dir, v);
+    } else if (!strcmp(k, "env")) {
+        if (a->n_env < BM_MAX_ENV && strchr(v, '=') && v[0] != '=') copy(a->env[a->n_env++], sizeof a->env[0], v);
+    } else if (!strcmp(k, "official_md5")) copy(a->official_md5, sizeof a->official_md5, v);
+    else if (!strcmp(k, "needs_official")) copy(a->needs, sizeof a->needs, v);
+    else if (!strcmp(k, "args")) copy(a->args, sizeof a->args, v);
+    else if (!strcmp(k, "data")) copy(a->data, sizeof a->data, v), x->data_set = 1;
     else if (!strcmp(k, "conf")) copy(a->conf, sizeof a->conf, v);
     else if (!strcmp(k, "prefix")) copy(a->prefix, sizeof a->prefix, v);
     else if (!strcmp(k, "run_from")) copy(a->run_from, sizeof a->run_from, !strcmp(v, "stick") ? "stick" : "ram");
@@ -389,16 +400,54 @@ static void finish_detail(App *a) {
     if (a->mtime > 0 && localtime_r(&t, &tm) && tm.tm_year > 90)
         snprintf(date, sizeof date, " \xC2\xB7 %d %s %d", tm.tm_mday, mon[tm.tm_mon], tm.tm_year + 1900);
     /* where it runs from, and whether it is encrypted, are the row's chips */
-    char where[64];
+    char where[96];
     if (a->official_build)
-        snprintf(where, sizeof where, "Official SP-16 software %s%s", *a->version ? a->version : "(unknown version)",
-                 *a->gui ? " + own GUI" : "");
-    else
+        snprintf(where, sizeof where, "Official %s software %s%s", *a->model ? a->model : unit()->name,
+                 *a->version ? a->version : "(unknown version)", *a->gui ? " + own GUI" : "");
+    else if (a->as_official) {
+        const char *lib = strrchr(a->preload, '/');
+        snprintf(where, sizeof where, "Official %s software %s%s%s", unit()->name, *a->version ? a->version : "",
+                 *a->preload ? " + " : "", *a->preload ? (lib ? lib + 1 : a->preload) : "");
+    } else
         copy(where, sizeof where, a->source == SRC_STICK ? "On the USB stick" : "Inside autoexec.bin");
-    if (*a->version && !a->official_build) snprintf(ver, sizeof ver, "v%s \xC2\xB7 ", a->version);
-    if (!a->ready) snprintf(a->detail, sizeof a->detail, "Unpacking from autoexec.bin\xE2\x80\xA6");
+    if (*a->version && !a->official_build && !a->as_official) snprintf(ver, sizeof ver, "v%s \xC2\xB7 ", a->version);
+    if (a->as_official) size[0] = 0, date[0] = 0;
+    if (*a->unavailable) snprintf(a->detail, sizeof a->detail, "%s", a->unavailable);
+    else if (a->as_official) snprintf(a->detail, sizeof a->detail, "%s%s%s", *a->desc ? a->desc : "", *a->desc ? " \xC2\xB7 " : "", where);
+    else if (!a->ready) snprintf(a->detail, sizeof a->detail, "Unpacking from autoexec.bin\xE2\x80\xA6");
     else if (*a->desc) snprintf(a->detail, sizeof a->detail, "%s \xC2\xB7 %s%s", a->desc, ver, size);
     else snprintf(a->detail, sizeof a->detail, "%s \xC2\xB7 %s%s%s", where, ver, size, date);
+}
+
+/* exe=official: the unit's installed official application, run as the unit runs it, with a library preloaded (a mod
+ * of it) and its own environment lines. It keeps the unit's own settings (data=none) unless the entry names a folder.
+ * It is listed whatever happens, with the reason when it cannot start: the official application is missing, it is
+ * not the release the entry needs (needs_official=, by its size), or the preload library is not on the stick. The
+ * exact build (official_md5=) is checked by the launcher when it starts, since hashing 12 MB here would slow the menu. */
+static void consider_official(App *a, int data_set) {
+    struct stat st;
+    if (!data_set) copy(a->data, sizeof a->data, "none");
+    copy(a->run_from, sizeof a->run_from, "stick"); /* never copied: it is the installed one */
+    if (a->accent == accent_for(a->id)) a->accent = OFFICIAL_ACCENT;
+    const char *v = installed_release();
+    copy(a->version, sizeof a->version, v ? v : "");
+    if (!v) {
+        snprintf(a->unavailable, sizeof a->unavailable, "Needs the official %s software, which is not installed",
+                 unit()->name);
+    } else if (*a->needs && strcmp(a->needs, v) != 0) {
+        snprintf(a->unavailable, sizeof a->unavailable, "Needs the official %s software %s \xC2\xB7 this unit has %s",
+                 unit()->name, a->needs, *v ? v : "another release");
+    } else if (*a->preload && (stat(a->preload, &st) != 0 || !S_ISREG(st.st_mode))) {
+        const char *lib = strrchr(a->preload, '/');
+        snprintf(a->unavailable, sizeof a->unavailable, "%s is missing from its folder", lib ? lib + 1 : a->preload);
+    }
+    if (stat(a->exe, &st) == 0) a->size = (long long)st.st_size, a->mtime = (long)st.st_mtime;
+    char folder[320];
+    copy(folder, sizeof folder, a->dir); /* its screen resources: beside its app.ini, as for any folder app */
+    if (!*a->gui) snprintf(a->gui, sizeof a->gui, "%s/%s-gui", folder, a->id);
+    if (!strcmp(a->gui, "none") || stat(a->gui, &st) != 0 || !S_ISDIR(st.st_mode)) a->gui[0] = 0;
+    bm_log("apps: %s: the official %s application%s%s, %d environment line(s)%s%s", a->id, unit()->name,
+           *a->preload ? " with " : "", a->preload, a->n_env, *a->unavailable ? ": " : "", a->unavailable);
 }
 
 /* Adds the app if its executable is compatible (or it is still being unpacked). Settings come from `ini`. */
@@ -408,10 +457,16 @@ static void consider(AppList *l, AppSource src, const char *id, const char *dir,
     App *a = &l->app[l->n];
     app_defaults(a, src, id, dir);
     if (exe) copy(a->exe, sizeof a->exe, exe);
-    IniCtx x = {a, 0};
+    IniCtx x = {a, 0, 0};
     if (ini) read_kv(ini, app_kv, &x);
     if (x.hidden) return;
     a->ready = !pending;
+    if (a->as_official && a->ready) {
+        consider_official(a, x.data_set);
+        finish_detail(a);
+        l->n++;
+        return;
+    }
     if (!*a->exe) {
         if (pending) a->ready = 0;
         else { bm_log("apps: %s: no executable (exe= in app.ini)", dir); l->skipped++; return; }
@@ -439,11 +494,18 @@ static void consider(AppList *l, AppSource src, const char *id, const char *dir,
             /* a release only when the file is exactly that program (plus, encrypted, the padding to 512 bytes): a
              * modified one may carry more after its section headers */
             long long whole = a->encrypted ? (elf_bytes + 511) / 512 * 512 : elf_bytes;
-            const char *v = whole == a->size ? release_for_size(elf_bytes) : NULL;
+            const Unit *model = NULL;
+            const char *v = whole == a->size ? release_for_size(elf_bytes, &model) : NULL;
             copy(a->version, sizeof a->version, v ? v : "");
+            copy(a->model, sizeof a->model, model ? model->name : "");
             if (a->accent == accent_for(a->id)) a->accent = OFFICIAL_ACCENT;
-            bm_log("apps: %s: the official SP-16 application%s, %s (program %lld bytes, file %lld)", a->exe,
-                   a->encrypted ? " (encrypted)" : "", v ? v : "unknown version", elf_bytes, a->size);
+            /* the other unit's application: the panel and the screen layout are not this unit's */
+            if (model && model != unit())
+                snprintf(a->unavailable, sizeof a->unavailable, "Official %s software %s \xC2\xB7 made for the %s, not this %s",
+                         model->name, v, model->name, unit()->name);
+            bm_log("apps: %s: the official %s application%s, %s (program %lld bytes, file %lld)%s", a->exe,
+                   model ? model->name : "(model unknown)", a->encrypted ? " (encrypted)" : "",
+                   v ? v : "unknown version", elf_bytes, a->size, *a->unavailable ? ": not for this unit" : "");
         } else if (elf_appinfo(a)) {
             bm_log("apps: %s: app info \"%s\" %s, icon %dx%d%s", a->exe, a->name, a->version, a->icon_w, a->icon_h,
                    a->encrypted ? " (encrypted)" : "");
@@ -534,8 +596,8 @@ static int by_name(const void *a, const void *b) {
 
 static void official_entry(App *a) {
     app_defaults(a, SRC_OFFICIAL, "official", "/root/pdj");
-    copy(a->name, sizeof a->name, "Pioneer DJ - Toraiz SP-16");
-    copy(a->exe, sizeof a->exe, "/root/pdj/EP085_Main_R");
+    copy(a->name, sizeof a->name, unit()->official_name);
+    copy(a->exe, sizeof a->exe, unit()->official_exe);
     copy(a->data, sizeof a->data, "none");
     a->accent = OFFICIAL_ACCENT;
     struct stat st;
@@ -546,7 +608,9 @@ static void official_entry(App *a) {
     }
     a->size = (long long)st.st_size;
     a->mtime = (long)st.st_mtime;
-    const char *v = release_for_size(a->size);
+    const Unit *model;
+    const char *v = release_for_size(a->size, &model);
+    if (model != unit()) v = NULL;
     if (v) {
         snprintf(a->detail, sizeof a->detail, "Official firmware \xC2\xB7 version %s", v);
     } else {
@@ -618,7 +682,8 @@ int apps_default(const AppList *l, const Config *c) {
         memmove(spec, t, strlen(t) + 1);
         if (!*spec) return -1;
     }
-    return apps_find(l, spec);
+    int i = apps_find(l, spec);
+    return i >= 0 && *l->app[i].unavailable ? -1 : i; /* never a countdown to something that cannot start */
 }
 
 static const char *source_name(AppSource s) {
@@ -670,6 +735,17 @@ int apps_write_choice(const App *a, const char *path) {
     put(f, "BM_ENCRYPTED", a->encrypted ? "1" : "0");
     put(f, "BM_OFFICIAL_BUILD", a->official_build ? "1" : "0");
     put(f, "BM_GUI", a->gui);
+    put(f, "BM_UNIT", unit()->key);
+    put(f, "BM_AS_OFFICIAL", a->as_official ? "1" : "0");
+    put(f, "BM_PRELOAD", a->preload);
+    put(f, "BM_OFFICIAL_MD5", a->official_md5);
+    snprintf(num, sizeof num, "%d", a->n_env);
+    put(f, "BM_ENV_COUNT", num);
+    for (int i = 0; i < a->n_env; i++) {
+        char key[24];
+        snprintf(key, sizeof key, "BM_ENV_%d", i + 1);
+        put(f, key, a->env[i]);
+    }
     snprintf(num, sizeof num, "%lld", a->size);
     put(f, "BM_SIZE", num);
     snprintf(num, sizeof num, "%ld", a->mtime);

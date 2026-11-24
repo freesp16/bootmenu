@@ -1,5 +1,5 @@
-/* The menu screen (800 x 480): header, a list of up to four visible rows, a footer with the controls and the
- * countdown. Everything is redrawn each frame from the state below (a few hundred quads). Selection and scrolling
+/* The menu screen (800 x 480, both units): header with the unit's name, a list of up to four visible rows, a footer
+ * with the controls and the countdown. Everything is redrawn each frame from the state below (a few hundred quads). Selection and scrolling
  * are instant (no animation): an encoder detent shows on the next vsync. */
 #include "bm.h"
 
@@ -101,7 +101,21 @@ static int row_at(const Menu *m, int x, int y) {
     return i >= 0 && i < m->apps->n ? i : -1;
 }
 
+static MenuAction input(Menu *m, const InputEvent *e);
+
+/* A row that cannot start on this unit says why instead (its reason is also its subtitle). */
 MenuAction menu_input(Menu *m, const InputEvent *e) {
+    MenuAction act = input(m, e);
+    const App *a = m->apps->n ? &m->apps->app[m->sel] : NULL;
+    if (act == MENU_LAUNCH && a && *a->unavailable) {
+        snprintf(m->message, sizeof m->message, "%s: %s", a->name, a->unavailable);
+        m->message_until = m->t + 12;
+        return MENU_IDLE;
+    }
+    return act;
+}
+
+static MenuAction input(Menu *m, const InputEvent *e) {
     m->countdown_end = 0;   /* any input stops the countdown */
     m->message_until = 0;   /* and dismisses a message */
     int n = m->apps->n;
@@ -262,7 +276,9 @@ void menu_draw(Menu *m) {
 
     /* header */
     logo(MARGIN + 2, 22, intro);
-    gfx_text(FONT_TITLE, 70, 46, rgba(0xeef1f6, (unsigned)(255 * intro)), "Boot menu");
+    float tw = gfx_text(FONT_TITLE, 70, 46, rgba(0xeef1f6, (unsigned)(255 * intro)), "Boot menu");
+    /* the unit it runs on: the same image serves the SP-16 and the DJS-1000 */
+    gfx_text(FONT_NAME, 70 + tw + 14, 45, rgba(0x8b95a8, (unsigned)(255 * intro)), unit()->name);
     char count[64];
     int apps = 0;
     for (int i = 0; i < l->n; i++) apps += l->app[i].source != SRC_OFFICIAL;
@@ -315,8 +331,11 @@ void menu_draw(Menu *m) {
         if (a->encrypted) cx -= chip(cx, y + ROW_H / 2.0f, "ENCRYPTED", CHIP_NEUTRAL, al, 0) + 6;
         if (a->source == m->def_source && !strcmp(a->id, m->def_id))
             cx -= chip(cx, y + ROW_H / 2.0f, m->def_label, CHIP_NEUTRAL, al, 0) + 6;
-        gfx_text_fit(FONT_NAME, tx, y + 32, rgba(is_sel ? 0xffffff : 0xdfe4ec, (unsigned)(255 * al)), a->name, cx - tx - 12);
-        gfx_text_fit(FONT_BODY, tx, y + 54, rgba(is_sel ? 0x9aa6bc : 0x7c869a, (unsigned)(255 * al)), a->detail, cx - tx - 12);
+        int off = *a->unavailable != 0; /* cannot start here: dimmed, its reason in the warning colour */
+        gfx_text_fit(FONT_NAME, tx, y + 32, rgba(off ? 0x8b95a8 : is_sel ? 0xffffff : 0xdfe4ec, (unsigned)(255 * al)),
+                     a->name, cx - tx - 12);
+        gfx_text_fit(FONT_BODY, tx, y + 54, rgba(off ? 0xd98a6c : is_sel ? 0x9aa6bc : 0x7c869a, (unsigned)(255 * al)),
+                     a->detail, cx - tx - 12);
     }
     gfx_clip(0, 0, 0, 0);
     /* scroll position */

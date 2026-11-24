@@ -5,6 +5,9 @@
  *   bootmenu --stick DIR [--embedded DIR] --list
  *   bootmenu --decrypt FILE [--key KEYFILE]           (an encrypted program, decrypted, on stdout)
  *   bootmenu --wake-backlight [--settings FILE]       (the LCD back to the official app's brightness, then exit)
+ *   bootmenu --unit-info                              (the unit, as shell assignments, for the launcher)
+ *   bootmenu --exec -- PROG [ARGS]                    (PROG as another program was started: see exec_mode())
+ * --unit sp16|djs1000 overrides the detected unit (unit.c), as BOOTMENU_UNIT does.
  *
  * Start-up order (every step logged with its time, "BOOTMENU <ms> ..."):
  *   1. SIGTERM to the official app            it shuts down while we do 2 and 3
@@ -101,14 +104,102 @@ static void usage(void) {
             "       bootmenu --stick DIR [--embedded DIR] --list\n"
             "       bootmenu --decrypt FILE [--key KEYFILE]\n"
             "       bootmenu --wake-backlight [--settings FILE]\n"
-            "       bootmenu --version\n");
+            "       bootmenu --unit-info\n"
+            "       bootmenu --exec -- PROG [ARGS]   (settings from BOOTMENU_EXEC_*, see src/main.c)\n"
+            "       bootmenu --version\n"
+            "--unit sp16|djs1000 (with any of these) overrides the detected unit\n");
 }
 
 typedef struct {
     Config cfg;
     const char *conf, *out, *render, *message, *resolve, *shot, *keys, *decrypt, *settings;
-    int fallback, list, no_official_stop, exit_after, wake_backlight;
+    int fallback, list, no_official_stop, exit_after, wake_backlight, unit_info;
 } Args;
+
+/* "SigBlk:0000000000000000 SigIgn:0000000000001000" (as /proc/PID/status has them) -> the two masks. */
+static int sig_mask(const char *s, const char *name, unsigned long long *out) {
+    const char *p = strstr(s, name);
+    if (!p) return -1;
+    p += strlen(name);
+    while (*p == ' ' || *p == '\t') p++;
+    char *end;
+    *out = strtoull(p, &end, 16);
+    return end == p ? -1 : 0;
+}
+
+/* NAME matches a --exec keep list: names and PREFIX* patterns, separated by spaces. */
+static int kept(const char *entry, const char *keep) {
+    size_t n = strcspn(entry, "=");
+    for (const char *p = keep; p && *p;) {
+        while (*p == ' ') p++;
+        size_t w = strcspn(p, " ");
+        if (w && p[w - 1] == '*' ? n >= w - 1 && !strncmp(entry, p, w - 1) : w == n && !strncmp(entry, p, n)) return 1;
+        p += w;
+    }
+    return 0;
+}
+
+/* --exec -- PROG [ARGS]: start a program as another one was started: in its environment, with its signal settings
+ * (blocked and ignored signals are inherited through exec, and a shell cannot set them), and with a library
+ * preloaded. The launcher uses it for the official application, in the state the unit started it in. Configured by
+ * the environment, so the launcher can put it in front of any command:
+ *   BOOTMENU_EXEC_ENV      a file of KEY=value lines: the environment to start from (else the current one)
+ *   BOOTMENU_EXEC_KEEP     names of the current environment kept over it: NAME or PREFIX*, separated by spaces
+ *   BOOTMENU_EXEC_SIGNALS  "SigBlk:HEX SigIgn:HEX", as /proc/PID/status gives them
+ *   BOOTMENU_EXEC_PRELOAD  a library put first in LD_PRELOAD (the current LD_PRELOAD follows)
+ * The preload is set here, just before exec, so it is never loaded into the menu itself. Returns only on failure. */
+extern char **environ;
+static int exec_mode(int argc, char **argv) {
+    if (argc < 4 || strcmp(argv[2], "--")) { fprintf(stderr, "bootmenu --exec -- PROG [ARGS]\n"); return 1; }
+    char *signals = getenv("BOOTMENU_EXEC_SIGNALS"), *preload = getenv("BOOTMENU_EXEC_PRELOAD");
+    char *env_file = getenv("BOOTMENU_EXEC_ENV"), *keep = getenv("BOOTMENU_EXEC_KEEP");
+    char *old_preload = getenv("LD_PRELOAD");
+    signals = signals ? strdup(signals) : NULL, preload = preload ? strdup(preload) : NULL;
+    keep = keep ? strdup(keep) : NULL, old_preload = old_preload ? strdup(old_preload) : NULL;
+    FILE *f = env_file && *env_file ? fopen(env_file, "r") : NULL;
+    if (f) {
+        int n = 0;
+        while (environ && environ[n]) n++;
+        char **now = calloc((size_t)n + 1, sizeof *now);
+        for (int k = 0; k < n; k++) now[k] = strdup(environ[k]);
+        clearenv();
+        char line[4096];
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            char *eq = strchr(line, '=');
+            if (!eq || eq == line || !strncmp(line, "LD_PRELOAD=", 11)) continue;
+            *eq = 0;
+            setenv(line, eq + 1, 1);
+        }
+        fclose(f);
+        for (int k = 0; k < n; k++)
+            if (now[k] && kept(now[k], keep) && strchr(now[k], '=')) putenv(now[k]);
+    }
+    for (const char *v = "BOOTMENU_EXEC_ENV\0BOOTMENU_EXEC_KEEP\0BOOTMENU_EXEC_SIGNALS\0BOOTMENU_EXEC_PRELOAD\0"; *v;
+         v += strlen(v) + 1)
+        unsetenv(v);
+    char value[1024] = "";
+    if (preload && *preload) snprintf(value, sizeof value, "%s", preload);
+    if (old_preload && *old_preload)
+        snprintf(value + strlen(value), sizeof value - strlen(value), "%s%s", *value ? ":" : "", old_preload);
+    if (*value) setenv("LD_PRELOAD", value, 1);
+    else unsetenv("LD_PRELOAD");
+    unsigned long long blk, ign;
+    if (signals && *signals && sig_mask(signals, "SigBlk:", &blk) == 0 && sig_mask(signals, "SigIgn:", &ign) == 0) {
+        sigset_t set;
+        sigemptyset(&set);
+        for (int sig = 1; sig <= 64; sig++) {
+            if (sig == SIGKILL || sig == SIGSTOP || sig == 32 || sig == 33) continue; /* and the C library's two */
+            unsigned long long bit = 1ULL << (sig - 1);
+            signal(sig, (ign & bit) ? SIG_IGN : SIG_DFL); /* exec keeps only what is ignored */
+            if (blk & bit) sigaddset(&set, sig);
+        }
+        sigprocmask(SIG_SETMASK, &set, NULL);
+    }
+    execv(argv[3], argv + 3);
+    fprintf(stderr, "bootmenu --exec: %s: %s\n", argv[3], strerror(errno));
+    return 127;
+}
 
 static int parse(Args *a, int argc, char **argv) {
     memset(a, 0, sizeof *a);
@@ -131,6 +222,12 @@ static int parse(Args *a, int argc, char **argv) {
         if (!strcmp(k, "--decrypt")) { VAL(a->decrypt) }
         if (!strcmp(k, "--settings")) { VAL(a->settings) }
         if (!strcmp(k, "--key")) { if (!v) return -1; snprintf(a->cfg.key, sizeof a->cfg.key, "%s", v); i++; continue; }
+        if (!strcmp(k, "--unit")) {
+            if (!v || unit_choose(v) != 0) { fprintf(stderr, "bootmenu: --unit sp16|djs1000\n"); return -1; }
+            i++;
+            continue;
+        }
+        if (!strcmp(k, "--unit-info")) { a->unit_info = 1; continue; }
         if (!strcmp(k, "--exit-after")) { if (!v) return -1; a->exit_after = atoi(v); i++; continue; }
         if (!strcmp(k, "--fallback")) { a->fallback = 1; continue; }
         if (!strcmp(k, "--list")) { a->list = 1; continue; }
@@ -152,7 +249,8 @@ static int parse(Args *a, int argc, char **argv) {
 static int headless_pick(const AppList *l, const Config *c) {
     int i = apps_default(l, c);
     if (i < 0) i = apps_find(l, "official");
-    if (i < 0 && l->n) i = 0;
+    for (int k = 0; i < 0 && k < l->n; k++)
+        if (!*l->app[k].unavailable) i = k;
     return i;
 }
 
@@ -198,10 +296,17 @@ static int scripted(const char *keys, double age, int *next, InputEvent *e) {
 int main(int argc, char **argv) {
     t_start = bm_now();
     setvbuf(stderr, NULL, _IOLBF, 0);
+    if (argc > 1 && !strcmp(argv[1], "--exec")) return exec_mode(argc, argv);
     static Args a;
     if (parse(&a, argc, argv) != 0) {
         usage();
         return 1;
+    }
+    if (a.unit_info) {
+        const Unit *u = unit();
+        printf("UNIT_KEY='%s'\nUNIT_NAME='%s'\nOFFICIAL_COMM='%s'\nOFFICIAL_EXE='%s'\nFAITHFUL_RESTART='%d'\n",
+               u->key, u->name, u->official_comm, u->official_exe, u->faithful_restart);
+        return 0;
     }
     /* An encrypted program, decrypted to stdout: the launcher writes it to RAM and runs it. */
     if (a.decrypt) {
@@ -234,8 +339,8 @@ int main(int argc, char **argv) {
         return apps_write_choice(&apps.app[i], a.out) == 0 ? 0 : 4;
     }
 
-    bm_log("start v" BM_VERSION " render=%s stick=%s embedded=%s", a.render, a.cfg.stick,
-           *a.cfg.embedded ? a.cfg.embedded : "-");
+    bm_log("start v" BM_VERSION " unit=%s (%s) render=%s stick=%s embedded=%s", unit()->key, unit()->name, a.render,
+           a.cfg.stick, *a.cfg.embedded ? a.cfg.embedded : "-");
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGPIPE, SIG_IGN);
@@ -304,6 +409,14 @@ int main(int argc, char **argv) {
         if (n < 64 && scripted(a.keys, t - t_start, &key_step, &ev[n])) n++;
         int action = MENU_IDLE;
         for (int i = 0; i < n && action == MENU_IDLE; i++) {
+            if (ev[i].kind == IN_POWER) {
+                /* DJS-1000: the power key is read through the panel, so the menu passes it on, as the official
+                 * application does: the stick's files are written out first */
+                bm_log("POWER: standby");
+                sync();
+                panel_request_standby();
+                continue;
+            }
             if (waiting_unpack) continue; /* the choice is made; only waiting for the copy */
             action = menu_input(m, &ev[i]);
         }

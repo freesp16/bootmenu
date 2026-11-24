@@ -6,6 +6,19 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+- The DJS-1000: the same `autoexec.bin` runs on it, tells the unit by its installed official application and shows
+  the model in the header. Its panel layout and POWER key are read, and its lamps are off while the menu is shown.
+  Its official software is started again in the environment and with the signal settings the unit gave it, with the
+  stick announced to it again, and the menu waits for it when the stick is in at power-on.
+- Mods of the official software: a folder app with `exe=official` starts the installed official application with
+  a library loaded first (`preload=`), optionally only on one release (`needs_official=`) or build
+  (`official_md5=`). A row that cannot start on the unit says why.
+- `env=` lines in an app's settings, with `${STICK}` and `${APP_DIR}`, and `BOOTMENU_UNIT` for every program.
+
+### Fixed
+- When the menu's X11 fallback crashes instead of failing, the default entry still starts without a screen.
+
 ## [1.1.0] - 2026-11-24
 
 ### Added

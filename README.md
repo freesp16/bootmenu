@@ -1,7 +1,7 @@
 # Boot menu
 
-A community boot menu for the Pioneer DJ TORAIZ SP-16. Put it on a USB stick, plug the stick in, and choose what
-the unit runs: its official software, or community software from the stick.
+A community boot menu for the Pioneer DJ TORAIZ SP-16 and DJS-1000. Put it on a USB stick, plug the stick in, and
+choose what the unit runs: its official software, or community software from the stick.
 
 ![The boot menu](docs/screenshot.png)
 
@@ -9,8 +9,12 @@ the unit runs: its official software, or community software from the stick.
   stick and the official software comes back.
 - **Launches community software.** Any compatible program copied next to `autoexec.bin` shows up in the list,
   plain or encrypted with the unit's key, under its file name. Updating it means copying a new file.
-- **Runs the official software from the stick.** A copy of the official application (`EP085_Main_R`), under any
-  file name and plain or encrypted, runs from the stick without replacing the installed one.
+- **One stick for both units.** The same `autoexec.bin` runs on the SP-16 and the DJS-1000. It tells them apart
+  by the official software installed and shows the model in its header.
+- **Runs mods of the official software.** An entry can start the installed official software with a library of
+  its own loaded first, such as the DJS-1000 mods (see [docs/apps.md](docs/apps.md)).
+- **Runs the official software from the stick.** A copy of the official application (`EP085_Main_R` or
+  `EP113_Main_R`), under any file name and plain or encrypted, runs from the stick without replacing the installed one.
 - **Built for the hardware.** It starts while the official software is still shutting down and draws on the GPU,
   so the menu is on screen quickly and reacts immediately to the SELECT encoder.
 - **Remembers your choice.** The last app you started becomes the default and starts on its own after a short
@@ -20,7 +24,7 @@ the unit runs: its official software, or community software from the stick.
 
 1. Download `autoexec.bin` from the [latest release](../../releases/latest).
 2. Copy it to the root of a FAT32 USB stick, together with the software you want to run.
-3. Plug the stick into the SP-16 while it is on.
+3. Plug the stick into the SP-16 or the DJS-1000 while it is on.
 
 | Control | Action |
 |---|---|
@@ -55,4 +59,5 @@ GPL-3.0-or-later (see [LICENSE](LICENSE)). The Inter font is under the SIL Open 
 ([fonts/INTER-LICENSE.txt](fonts/INTER-LICENSE.txt)).
 
 This is an independent community project. It is not affiliated with or endorsed by Pioneer DJ or AlphaTheta.
-TORAIZ and SP-16 are their trademarks, used here only to say which hardware this runs on. No firmware is included.
+TORAIZ, SP-16 and DJS-1000 are their trademarks, used here only to say which hardware this runs on. No firmware is
+included.
