@@ -79,7 +79,9 @@ LOG="${USB:-/tmp}/bootmenu.log"
   mkdir -p "$STAGE/bin" "$STAGE/apps" "$STAGE/run" 2>/dev/null
   rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" 2>/dev/null
 
-  # 1) The small files first: the menu and the SSH server go to RAM before anything else.
+  # 1) The small files first: the menu and the SSH server go to RAM before anything else. The old menu first goes
+  # (unlinked), as the last session's may still be running (--hide-cursor) and a running file cannot be written.
+  rm -f "$STAGE/bin/bootmenu" 2>/dev/null
   if ! cp "$SELF_DIR/bootmenu" "$STAGE/bin/bootmenu" 2>/dev/null; then
     echo "ERROR: could not copy the menu out of the image (no room in /tmp?)"; exit 1
   fi
@@ -649,6 +651,11 @@ DISPLAY=${DISPLAY:-:0}   # the boot scripts never export it; the X server (Xfbde
 export DISPLAY
 cd "$STAGE" 2>/dev/null || cd /tmp
 
+# The X server's cursor hidden for the whole session (see x11_hide_cursor in src/x11.c). Started while the official app
+# is still connected, so the server never starts over and shows its cursor between the menu and an app.
+"$STAGE/bin/bootmenu" --hide-cursor </dev/null &
+CURSOR_PID=$!
+
 # Network and SSH beside the menu, never in front of it.
 ( setup_network; start_ssh ) &
 
@@ -768,6 +775,12 @@ after_app
 if [ -f "$STAGE/gone" ]; then restore_once; else restore_official; fi   # first: the unit is usable again at once
 [ -f "$STAGE/gone" ] && wait "$WATCHER_PID" 2>/dev/null   # its recovery steps end up in the log before this one
 stop_ssh
+# The cursor stays hidden until the official software has connected to the X server, then the helper gives the server
+# its own cursor back. Signalled only while the PID is still the helper's.
+( sleep 30
+  if tr '\0' ' ' < "/proc/$CURSOR_PID/cmdline" 2>/dev/null | grep -q -- '--hide-cursor'; then
+    kill -TERM "$CURSOR_PID" 2>/dev/null
+  fi ) &
 rm -f "$STAGE/runner.pid" "$STAGE/state"
 echo "runner: session over"
 sync

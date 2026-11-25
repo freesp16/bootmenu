@@ -7,6 +7,7 @@
  *   bootmenu --wake-backlight [--settings FILE]       (the LCD back to the official app's brightness, then exit)
  *   bootmenu --unit-info                              (the unit, as shell assignments, for the launcher)
  *   bootmenu --exec -- PROG [ARGS]                    (PROG as another program was started: see exec_mode())
+ *   bootmenu --hide-cursor [WAIT_S]                   (the X server's cursor hidden while it runs: x11.c)
  * --unit sp16|djs1000 overrides the detected unit (unit.c), as BOOTMENU_UNIT does.
  *
  * Start-up order (every step logged with its time, "BOOTMENU <ms> ..."):
@@ -106,6 +107,7 @@ static void usage(void) {
             "       bootmenu --wake-backlight [--settings FILE]\n"
             "       bootmenu --unit-info\n"
             "       bootmenu --exec -- PROG [ARGS]   (settings from BOOTMENU_EXEC_*, see src/main.c)\n"
+            "       bootmenu --hide-cursor [WAIT_S]  (hides the X server's cursor while it runs)\n"
             "       bootmenu --version\n"
             "--unit sp16|djs1000 (with any of these) overrides the detected unit\n");
 }
@@ -297,6 +299,7 @@ int main(int argc, char **argv) {
     t_start = bm_now();
     setvbuf(stderr, NULL, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "--exec")) return exec_mode(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--hide-cursor")) return x11_hide_cursor(argc > 2 ? atof(argv[2]) : 90);
     static Args a;
     if (parse(&a, argc, argv) != 0) {
         usage();

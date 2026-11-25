@@ -19,6 +19,7 @@ All notable changes to this project are listed here. The format follows
   it comes right after the framebuffer, since the GPU's X11 window stays black there.
 
 ### Fixed
+- The X server's cursor no longer shows over the menu or the programs it starts.
 - When the menu's last screen fallback crashes instead of failing, the default entry still starts without a screen.
 
 ## [1.1.0] - 2026-11-24
