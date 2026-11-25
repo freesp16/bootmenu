@@ -105,15 +105,37 @@ echo "mod added" > $S/my_fw-gui/Resource/added.txt
 printf 'default=hello\ntimeout=3\nssh=0\n' > $S/bootmenu.conf
 printf 'greeting=hi there\n' > $S/hello.conf
 
+orig_fw_pid=$(pidof EP085_Main_R)
+touch $S/SP16_SAFE_MODE
+sh /work/iso/autoexec.sh $S
+check "SP16_SAFE_MODE bypasses launcher" "safe mode flag present" $S/bootmenu.log
+[ "$(pidof EP085_Main_R)" = "$orig_fw_pid" ] && [ ! -f /tmp/bootmenu/runner.pid ] \
+  && echo "PASS safe mode left official app running (same pid)" \
+  || { echo "FAIL safe mode modified official app or started runner"; fail=1; }
+rm -f $S/SP16_SAFE_MODE $S/bootmenu.log
+
+printf 'default=hello\ntimeout=3\nssh=0\ncold_boot_wait_s=5\n' > $S/bootmenu.conf
+cp $B/sh /tmp/apl_start && chmod 0755 /tmp/apl_start
+/tmp/apl_start -c 'sleep 2' &
+apl_pid=$!
 sh /work/iso/autoexec.sh $S
 L=$S/bootmenu.log
-wait_for "runner: hello exited" $L
-wait_for "starting official" $L 10
+wait_for "runner: hello exited" $L 30
+wait_for "starting official" $L 15
+wait $apl_pid 2>/dev/null || true
+rm -f /tmp/apl_start
 sleep 1
+check "cold boot waited for apl_start" "cold boot: waiting for apl_start" $L
+check "cold boot waited until apl_start finished" "cold boot: apl_start finished after [1-5]s" $L
 check "the stub logged the hook" "autoexec.sh stub: hook ran" $L
 check "menu fell back to the default without a screen" "menu: no screen; the default entry was chosen" $L
 check "official app stopped before the app" "runner: launching hello" $L
 check "embedded app unpacked" "embedded app hello unpacked to RAM" $L
+grep -qF " /tmp/bootmenu/run tmpfs " /proc/mounts \
+  && echo "PASS /tmp/bootmenu/run is mounted as tmpfs" || { echo "FAIL /tmp/bootmenu/run not tmpfs"; fail=1; }
+[ -L /tmp/bootmenu/apps/hello ] && [ -d /tmp/bootmenu/run/embedded/hello ] \
+  && echo "PASS embedded app staged in /tmp/bootmenu/run/embedded" \
+  || { echo "FAIL embedded app not staged in /tmp/bootmenu/run/embedded"; fail=1; }
 check "app got its conf as HELLO_*" "HELLO_GREETING=hi there" $L
 check "app args from app.ini" "arg1=--demo" $L
 check "/root/data redirected to the stick" "/root/data writable=yes" $L
@@ -137,6 +159,9 @@ sh $CTL update hello2 < /tmp/hello.new
 wait_for "runner: hello2 exited" $L 20
 [ -f $S/hello2 ] && echo "PASS ctl update wrote the app beside autoexec.bin" || { echo "FAIL no $S/hello2"; fail=1; }
 check "updated app ran from RAM" "hello2: copied to RAM" $L
+[ -x /tmp/bootmenu/run/hello2.bin ] && echo "PASS updated app cached in /tmp/bootmenu/run" || { echo "FAIL /tmp/bootmenu/run/hello2.bin missing"; fail=1; }
+if ls /tmp/bootmenu/run/update.* >/dev/null 2>&1; then echo "FAIL leftover update.* in /tmp/bootmenu/run"; fail=1
+else echo "PASS ctl update staged cleanly in /tmp/bootmenu/run"; fi
 
 echo "--- an encrypted app"
 sh $CTL run secret
@@ -190,6 +215,90 @@ check "the new log shows how the last session ended" "the end of the previous se
 check "...with its lines" "watcher: pid [0-9]* ended" $S/bootmenu.log
 echo "--- log (before the pull)"; cat /work/vol/before-pull.log
 echo "--- end of that session"; cat $E 2>/dev/null; sed -n '/the end of the previous session/,/^---$/p' $S/bootmenu.log
+
+stop_runner_clean() {
+  touch /tmp/bootmenu/runner.done 2>/dev/null || true
+  p=$(cat /tmp/bootmenu/child.pid 2>/dev/null || true); [ -n "$p" ] && kill -KILL "$p" 2>/dev/null || true
+  p=$(cat /tmp/bootmenu/runner.pid 2>/dev/null || true); [ -n "$p" ] && kill -KILL "$p" 2>/dev/null || true
+  sleep 1
+  umount -l /tmp/bootmenu/run 2>/dev/null || true
+  rm -rf /tmp/bootmenu
+}
+
+echo "--- gl-x11 crash fallback (rc=139 without choice.sh)"
+stop_runner_clean
+mkdir -p /tmp/iso_crash && cp -R /work/iso/. /tmp/iso_crash/
+mv /tmp/iso_crash/bootmenu /tmp/iso_crash/bootmenu.real
+cat > /tmp/iso_crash/bootmenu <<'CRASHW'
+#!/bin/sh
+case " $* " in
+  *" --render x11 "*" --fallback "*|*" --fallback "*" --render x11 "*)
+    echo "WRAPPER_X11_CRASH" >> /tmp/wrapper.log
+    exit 139
+    ;;
+  *" --resolve "*)
+    echo "WRAPPER_RESOLVE $*" >> /tmp/wrapper.log
+    ;;
+esac
+exec /tmp/iso_crash/bootmenu.real "$@"
+CRASHW
+chmod 0755 /tmp/iso_crash/bootmenu
+cp /work/apps/crashy $S/crashy
+printf 'default=hello\nssh=0\n' > $S/bootmenu.conf
+rm -f $S/bootmenu.log /tmp/wrapper.log
+sh /tmp/iso_crash/autoexec.sh $S
+L=$S/bootmenu.log
+wait_for "runner: hello exited" $L 20
+wait_for "starting official" $L 15
+sleep 1
+check "gl-x11 rc=139 triggered headless default resolve" "gl-x11 failed without a choice (rc=139); resolving default headlessly" $L
+check "wrapper simulated x11 crash" "WRAPPER_X11_CRASH" /tmp/wrapper.log
+check "wrapper recorded --resolve default" "WRAPPER_RESOLVE .*--resolve default" /tmp/wrapper.log
+check "FALLBACK=1 restored official app after app exit" "runner: starting official EP085_Main_R" $L
+pidof EP085_Main_R >/dev/null && echo "PASS official app running after crash fallback" || { echo "FAIL official app not running after fallback"; fail=1; }
+
+sh $CTL run crashy
+wait_for "resolving official headlessly" $L 20
+wait_for "starting official" $L 15
+sleep 1
+check "non-empty MSG resolves official on gl-x11 crash" "gl-x11 failed without a choice (rc=139); resolving official headlessly" $L
+check "wrapper recorded --resolve official" "WRAPPER_RESOLVE .*--resolve official" /tmp/wrapper.log
+pidof EP085_Main_R >/dev/null && echo "PASS official app running after MSG fallback" || { echo "FAIL official app not running after MSG fallback"; fail=1; }
+
+echo "--- poweroff standby path (rc=9)"
+stop_runner_clean
+killall -TERM EP085_Main_R 2>/dev/null || true
+sleep 1
+killall -KILL EP085_Main_R 2>/dev/null || true
+mkdir -p /tmp/iso_pwr && cp -R /work/iso/. /tmp/iso_pwr/
+cat > /tmp/iso_pwr/bootmenu <<'PWRSTUB'
+#!/bin/sh
+case " $* " in
+  *" --wake-backlight "*|*" --list "*|*" --resolve "*) exit 0 ;;
+esac
+exit 9
+PWRSTUB
+chmod 0755 /tmp/iso_pwr/bootmenu
+printf '#!/bin/sh\necho "$0" > /tmp/poweroff.called\n' > $B/poweroff
+cp $B/poweroff $B/halt
+chmod 0755 $B/poweroff $B/halt
+sleep 60 &
+fake_db_pid=$!
+mkdir -p /tmp/bootmenu
+echo "$fake_db_pid" > /tmp/bootmenu/dropbear.pid
+printf 'ssh=0\n' > $S/bootmenu.conf
+rm -f $S/bootmenu.log /tmp/poweroff.called
+sh /tmp/iso_pwr/autoexec.sh $S
+L=$S/bootmenu.log
+wait_for "runner: session over" $L 15
+i=0; while [ ! -f /tmp/poweroff.called ] && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+check "rc=9 sets standby requested" "runner: menu: power button requested standby" $L
+check "rc=9 logs standby halt without official restart" "standby requested; halting without restarting official software" $L
+pidof EP085_Main_R >/dev/null && { echo "FAIL rc=9 restarted official software"; fail=1; } || echo "PASS rc=9 did not restart official software"
+! kill -0 "$fake_db_pid" 2>/dev/null && [ ! -f /tmp/bootmenu/dropbear.pid ] \
+  && echo "PASS rc=9 stopped dropbear.pid" || { echo "FAIL rc=9 left dropbear.pid running"; fail=1; }
+[ -f /tmp/poweroff.called ] && echo "PASS rc=9 invoked poweroff/halt" || { echo "FAIL rc=9 did not invoke poweroff/halt"; fail=1; }
+rm -rf /tmp/iso_crash /tmp/iso_pwr /tmp/wrapper.log /tmp/poweroff.called $B/poweroff $B/halt
 exit $fail
 TEST
 
