@@ -521,6 +521,14 @@ run_menu() {
     echo $! > "$STAGE/child.pid"; wait $!; rc=$?
     rm -f "$STAGE/child.pid"
     [ $rc -eq 3 ] && FALLBACK=1 && echo "runner: menu: no screen; the default entry was chosen without it"
+    if [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] \
+       && [ ! -f "$STAGE/poweroff" ]; then
+      spec=default
+      [ -n "$MSG" ] && spec=official
+      echo "runner: menu: gl-x11 failed without a choice (rc=$rc); resolving $spec headlessly"
+      "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" --resolve "$spec" || true
+      [ -f "$STAGE/choice.sh" ] && FALLBACK=1
+    fi
   fi
   MSG=""
   echo "runner: menu exited rc=$rc"
