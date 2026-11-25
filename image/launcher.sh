@@ -182,11 +182,47 @@ read_conf() {
   return 0
 }
 if [ -f "$USB_RUN/bootmenu.conf" ]; then
-  read_conf "$USB_RUN/bootmenu.conf" BOOTMENU_ 'ssh*'
+  read_conf "$USB_RUN/bootmenu.conf" BOOTMENU_ 'ssh*|cold_boot_wait_s'
   echo "runner: network settings from bootmenu.conf"
 elif read_conf "$USB_RUN/freesp16.conf" BOOTMENU_ 'ssh*'; then
   echo "runner: network settings from freesp16.conf (no bootmenu.conf)"
 fi
+
+apl_start_running() {
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$pid" = "$$" ] || [ "$pid" = "$PPID" ] && continue
+    [ -r "$p/cmdline" ] || continue
+    cmd=$(tr '\000' ' ' < "$p/cmdline" 2>/dev/null) || continue
+    case "$cmd" in
+      *apl_start*)
+        case "$cmd" in
+          *"$STAGE/run.sh"*|*"launcher.sh"*) continue ;;
+        esac
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+wait_cold_boot() {
+  wait_s=${BOOTMENU_COLD_BOOT_WAIT_S:-25}
+  case "$wait_s" in ''|*[!0-9]*) wait_s=25;; esac
+  [ "$wait_s" -eq 0 ] && return 0
+  apl_start_running || return 0
+  echo "runner: cold boot: waiting for apl_start (up to ${wait_s}s)"
+  i=0
+  while [ $i -lt "$wait_s" ] && [ ! -f "$STAGE/gone" ] && apl_start_running; do
+    sleep 1
+    i=$((i+1))
+  done
+  if apl_start_running; then
+    echo "runner: cold boot: apl_start still running after ${i}s; continuing"
+  else
+    echo "runner: cold boot: apl_start finished after ${i}s"
+  fi
+}
 
 # --- Network: eth0 (the rear LINK port) up, plus a fixed alias address to reach the unit at. --------------------------
 NET_IF=eth0
@@ -501,6 +537,8 @@ load_choice() {
 DISPLAY=${DISPLAY:-:0}   # the boot scripts never export it; the X server (Xfbdev) is :0 (used by gl-x11 only)
 export DISPLAY
 cd "$STAGE" 2>/dev/null || cd /tmp
+
+wait_cold_boot
 
 # Network and SSH beside the menu, never in front of it.
 ( setup_network; start_ssh ) &

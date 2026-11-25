@@ -28,6 +28,7 @@ timeout=8           # seconds before the default starts; 0 = wait for you
 scan_root=1         # 0 = only look in apps/
 show_official=1     # 0 = hide the official software row
 official_wait_ms=8000
+cold_boot_wait_s=25 # seconds to wait for cold-boot startup (apl_start); 0 = off
 ```
 
 ## When things happen
