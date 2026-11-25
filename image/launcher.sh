@@ -63,7 +63,7 @@ LOG="${USB:-/tmp}/bootmenu.log"
     cat "$STAGE/end.log"
     echo "---"
   fi
-  rm -f "$STAGE/end.log"
+  rm -f "$STAGE/end.log" "$STAGE/standby-in-progress" "$STAGE/helpers.log"
   rmdir "$STAGE/restore.lock" 2>/dev/null
   # Bind mounts a runner that died could not undo (each listed once, so never unmounted twice).
   if [ -f "$STAGE/mounts" ]; then
@@ -109,7 +109,7 @@ echo $$ > "$STAGE/runner.pid"
 echo "runner: detached, pid $$"
 
 # Flush the log to the stick every few seconds, so it survives pulling the stick or power-cycling.
-( while kill -0 $$ 2>/dev/null; do sleep 5; sync; done ) &
+( while kill -0 $$ 2>/dev/null; do sleep 5; sync; done ) </dev/null >/dev/null 2>&1 &
 
 # --- Official app --------------------------------------------------------------------------------------------------------
 official_pids() {
@@ -305,13 +305,68 @@ global_bind() {
 # watcher may both try). Unmounting /root/data twice would take the unit's own data partition off. Lazily once the
 # stick is gone, so nothing waits on a device that is not there.
 after_app() {
-  claim="$STAGE/mounts.$$"
+  local mode=${1:-normal} claim="$STAGE/mounts.$$" failed=0 target
   mv "$STAGE/mounts" "$claim" 2>/dev/null || return 0
-  while read -r m; do
-    if [ -f "$STAGE/gone" ]; then umount -l "$m" 2>/dev/null; else umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null; fi
-    echo "runner: $m restored"
+  while IFS= read -r target; do
+    if [ "$mode" = standby ]; then
+      if ! umount "$target"; then
+        echo "$target" >> "$STAGE/mounts"
+        failed=1
+        continue
+      fi
+    else
+      if [ ! -e "$STAGE/gone" ] && umount "$target" 2>/dev/null; then
+        :
+      else
+        umount -l "$target" 2>/dev/null
+      fi
+    fi
+    echo "runner: $target restored"
   done < "$claim"
   rm -f "$claim"
+  return "$failed"
+}
+
+mounted_source() {
+  awk -v path="$USB_RUN" '$2 == path {print $1; exit}' /proc/mounts
+}
+
+# stdout and stderr must move off the stick before the real, non-lazy unmount.
+standby() {
+  local error="" detail="$STAGE/unmount-error" logfile="$STAGE/end.log" remaining mark_done menu="$STAGE/bin/bootmenu"
+  : > "$STAGE/standby-in-progress" || return 1
+  if [ ! -b "$DEV" ] || [ -e "$STAGE/gone" ] || [ "$(mounted_source)" != "$DEV" ]; then
+    error="Boot USB is unavailable"
+  elif ! after_app standby; then
+    error="Could not release app storage"
+  elif awk -v device="$DEV" -v path="$USB_RUN" '$1 == device && $2 != path {other=1} END {exit !other}' /proc/mounts; then
+    error="The Boot USB is still mounted elsewhere"
+  else
+    echo "runner: standby: app saved and exited; releasing $USB_RUN"
+    exec >> "$logfile" 2>&1
+    if { sync && umount "$USB_RUN"; } > "$detail" 2>&1 &&
+       remaining=$(mounted_source) && [ -z "$remaining" ]; then
+      mark_done="$STAGE/runner.done"
+      : > "$mark_done"
+      printf "%s\n" standby > "$STAGE/state"
+      echo "runner: standby: boot volume released; requesting panel standby"
+      "$menu" --standby </dev/null
+      echo "runner: panel standby returned while the unit was still on"
+      rm -f "$STAGE/standby-in-progress" "$STAGE/runner.pid"
+      stop_ssh
+      exit 1
+    fi
+    if [ -b "$DEV" ] && [ "$(mounted_source)" = "$DEV" ]; then
+      exec >> "$LOG_RUN" 2>&1
+      cat "$detail"
+    fi
+    error="Could not unmount the Boot USB"
+  fi
+
+  MSG="$error. Power is still on."
+  printf "runner: standby blocked: %s\n" "$MSG"
+  rm -f "$STAGE/standby-in-progress"
+  return 1
 }
 
 # After the stick is pulled, the official software is started once, by whichever of the runner and the stick watcher
@@ -415,6 +470,8 @@ launch_app() {
   stop_official
   log_holders "before launching $BM_ID"
   DATA=""
+  receipt_dir=""
+  local persistent=1
   if [ "$BM_DATA" != none ] && [ -n "$BM_DATA" ]; then
     DATA="$USB_RUN/$BM_DATA"
     # the official application keeps its files straight in /root/data; other apps in /root/data/<id>
@@ -429,6 +486,7 @@ launch_app() {
     if [ -n "$DATA" ] && ! global_bind "$DATA" /root/data; then
       if mount -t tmpfs -o size=16m tmpfs /root/data; then
         echo /root/data >> "$STAGE/mounts"
+        persistent=0
         echo "runner: WARNING bind mount failed; /root/data is a 16 MB RAM tmpfs while $BM_ID runs"
       else
         echo "runner: ERROR could not redirect /root/data off NAND; not starting $BM_ID"; return 1
@@ -438,11 +496,17 @@ launch_app() {
       echo "runner: WARNING could not mount its screen resources; $BM_ID uses the unit's"
     fi
   fi
+  if [ "$persistent" -eq 1 ]; then
+    case "$DATA" in
+      "$USB_RUN"/*) receipt_dir=$(mktemp -d "$STAGE/power.XXXXXX") || receipt_dir="" ;;
+    esac
+  fi
   echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}${APP_GUI:+, /root/gui = $APP_GUI}, $MOUNT_MODE)"
   (
     cd "$BM_DIR" 2>/dev/null || cd /tmp
     [ -n "$BM_CONF" ] && read_conf "$USB_RUN/$BM_CONF" "$BM_PREFIX" && echo "runner: $BM_CONF -> ${BM_PREFIX}*"
     export HOME="${DATA:-$STAGE}" BOOTMENU_STICK="$USB_RUN" BOOTMENU_APP_DIR="$BM_DIR" BOOTMENU_APP_ID="$BM_ID"
+    export BOOTMENU_STANDBY_READY="${receipt_dir:+$receipt_dir/ready}"
     if [ "$MOUNT_MODE" = ns ]; then
       # the bind mounts as SRC DST pairs, then --, then the command: made in the app's own mount namespace
       set --
@@ -500,15 +564,17 @@ export DISPLAY
 cd "$STAGE" 2>/dev/null || cd /tmp
 
 # Network and SSH beside the menu, never in front of it.
-( setup_network; start_ssh ) &
+( setup_network; start_ssh ) >> "$STAGE/helpers.log" 2>&1 &
 
 # Watcher: the stick's block device disappearing ends the session; every 5 s the alias address is put back.
-DEV=$(awk -v m="$USB_RUN" '$2 == m { print $1; exit }' /proc/mounts 2>/dev/null)
+DEV=$(mounted_source)
 echo "runner: watching stick device ${DEV:-unknown}"
 (
   tick=0
   while [ ! -f "$STAGE/runner.done" ]; do
-    if { [ -n "$DEV" ] && [ ! -b "$DEV" ]; } || { [ -n "$DEV" ] && ! grep -q " $USB_RUN " /proc/mounts; }; then
+    if [ -n "$DEV" ] && [ ! -f "$STAGE/standby-in-progress" ] &&
+       { [ ! -b "$DEV" ] || [ "$(mounted_source)" != "$DEV" ]; } &&
+       [ ! -f "$STAGE/standby-in-progress" ] && [ ! -f "$STAGE/runner.done" ]; then
       # The session ends here, whatever the runner is doing: stop the app or menu, undo the mounts, start the official
       # software. The log goes to RAM (shown in bootmenu.log at the next insertion).
       touch "$STAGE/gone"
@@ -540,7 +606,7 @@ echo "runner: watching stick device ${DEV:-unknown}"
     fi
     sleep 1
   done
-) &
+) >> "$STAGE/helpers.log" 2>&1 &
 WATCHER_PID=$!
 
 # --- Supervisor --------------------------------------------------------------------------------------------------------
@@ -586,15 +652,23 @@ while :; do
       if ! launch_app; then MSG="$BM_NAME could not start (see bootmenu.log)"; NEXT=menu; continue; fi
       echo "$APP_PID" > "$STAGE/child.pid"
       echo "runner: $BM_ID pid $APP_PID"
-      ( sleep 5; log_holders "5 s after launching $BM_ID" ) &
+      ( sleep 5; log_holders "5 s after launching $BM_ID" ) >> "$STAGE/helpers.log" 2>&1 &
       wait "$APP_PID"; rc=$?
       rm -f "$STAGE/child.pid"
+      if [ -n "$receipt_dir" ]; then
+        saved=0
+        test ! -f "${receipt_dir}/ready" || saved=1
+        rmdir "$receipt_dir" 2>/dev/null || rm -rf "$receipt_dir"
+        if [ "$saved:$rc" = 1:76 ] && [ ! -e "$STAGE/request" ]; then
+          standby
+        fi
+      fi
       after_app
       t1=$(cut -d. -f1 /proc/uptime)
       echo "runner: $BM_ID exited rc=$rc after $((t1 - t0)) s"
       [ -f "$STAGE/gone" ] && break
       [ -f "$STAGE/request" ] && continue
-      if [ "$rc" -ne 0 ] && [ $((t1 - t0)) -lt 5 ]; then
+      if [ "$rc" -ne 0 ] && [ $((t1 - t0)) -lt 5 ] && [ -z "$MSG" ]; then
         MSG="$BM_NAME stopped right away (exit code $rc, see bootmenu.log)"
       fi
       NEXT=menu   # back to the menu when an app quits
@@ -718,6 +792,8 @@ CTL
   ln -sf "$STAGE/ctl.sh" "$STAGE/bin/ctl"
 
   # 4) Detach the runner (new session, so udev tearing down this process cannot take it along): the menu starts now.
+  # Starting in RAM lets the USB hook unmount its ISO as soon as we return.
+  cd "$STAGE" || exit 1
   echo "autoexec.sh: detaching runner"
   if command -v setsid >/dev/null 2>&1; then
     setsid "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$LOG" 2>&1 &

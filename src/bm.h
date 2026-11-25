@@ -129,6 +129,7 @@ int panel_open(char *info, size_t infolen);  /* 0 = running */
 int panel_fd(void);                          /* -1 when closed */
 /* Reads every frame that is ready (non-blocking) and appends decoded events; returns the count added. */
 int panel_poll(InputEvent *out, int max);
+int panel_request_standby(void);
 void panel_close(void);                      /* timer off, close: the device is idle for the next owner */
 
 /* ---- graphics (gfx.c) ----------------------------------------------------------------------------------------- */

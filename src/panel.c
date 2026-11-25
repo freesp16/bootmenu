@@ -9,7 +9,7 @@
  *     screen = round((940 - rawX) * 720 / 868) + 40, round((rawY - 87) * 405 / 779) + 29.
  * The driver keeps one transfer timer per device and refuses bits/bytes with EBUSY while it runs; the official app
  * leaves it on, so open() turns it off first and on last, and close() turns it off again (confirmed on hardware).
- * No TX (lamp) frame is ever sent.
+ * Normal menu input uses RX only. The launcher requests a TX frame during standby.
  *
  * Cost: one CRC over 124 bytes and a few compares per frame, on the menu's own thread between frames. */
 #include "bm.h"
@@ -29,6 +29,7 @@
 enum {
     REQ_SET_TIMER = 0x40017001UL, REQ_SET_INTERVAL = 0x40047002UL, REQ_SET_BITS = 0x40027003UL,
     REQ_SET_BYTES = 0x40047004UL, REQ_SET_ENDIAN = 0x40017009UL,
+    REQ_SEND = 0x40107000UL,
 };
 
 static struct {
@@ -152,4 +153,36 @@ void panel_close(void) {
     close(P.fd);
     P.fd = -1;
     bm_log("panel: closed (frames=%ld bad_crc=%ld, timer off)", P.frames, P.bad);
+}
+
+int panel_request_standby(void) {
+    char error[160];
+    if (panel_open(error, sizeof error)) {
+        bm_log("%s", error);
+        return 1;
+    }
+
+    /* 128-byte TX frame with mute and standby set, one part, and a CRC-16/X25 trailer. */
+    uint8_t tx[FRAME] = { [0] = 2, [102] = 1, [103] = 1, [110] = 4, [119] = 0xaa };
+    uint16_t crc = crc_x25(tx, 124);
+    tx[124] = crc & 0xff;
+    tx[125] = crc >> 8;
+    struct {
+        uint8_t multi_id, reserved, part_id, part_count;
+        uint32_t length;
+        uint64_t address;
+    } request = { .part_count = 1, .length = sizeof tx, .address = (uintptr_t)tx };
+
+    double deadline = bm_now() + 20.0;
+    do {
+        if (step(P.fd, "standby TX", REQ_SEND, &request, error, sizeof error)) {
+            bm_log("%s", error);
+            panel_close();
+            return 1;
+        }
+        usleep(250000);
+    } while (bm_now() < deadline);
+    bm_log("panel: standby did not cut power within 20 seconds");
+    panel_close();
+    return 1;
 }
