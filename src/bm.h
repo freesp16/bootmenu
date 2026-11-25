@@ -65,6 +65,7 @@ typedef struct {
     long icon_off;         /* file offset of the icon pixels */
     int encrypted;         /* 1 = the file is encrypted with the unit's key (crypt.c): the launcher decrypts it to RAM */
     int official_build;    /* 1 = the official SP-16 application (EP085_Main_R) under any file name: runs in /root/pdj */
+    int is_script;         /* 1 = explicit shell script launcher in a folder app */
     char gui[320];         /* its own screen resources, laid over /root/gui while it runs ("" = none): <id>-gui/ */
 } App;
 
@@ -84,8 +85,8 @@ void apps_remember(const Config *c, const App *a);  /* writes <stick>/bootmenu.l
 int apps_any_unready(const AppList *l);
 /* Writes the choice as shell assignments; 0 on success. */
 int apps_write_choice(const App *a, const char *path);
-/* ELF check: 1 = an ARM 32-bit little-endian soft-float executable this unit can run. `why` gets the reason if not.
- * encrypted: read the file through the unit's key. */
+/* ELF check: 1 = an ARM 32-bit little-endian executable (soft-float or static hard-float) this unit can run.
+ * `why` gets the reason if not. encrypted: read the file through the unit's key. */
 int elf_compatible(const char *path, int encrypted, char *why, size_t whylen);
 /* The app-info ELF note (owner "APPINFO", see docs/apps.md): display name, version
  * and an RGBA icon. Fills name (when the app has no ini name=), version and the icon fields; 1 when found. */

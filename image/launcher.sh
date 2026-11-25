@@ -487,10 +487,19 @@ launch_app() {
       [ -n "$DATA" ] && set -- "$@" "$DATA" /root/data
       [ -n "$APP_GUI" ] && set -- "$@" "$APP_GUI" /root/gui
       if [ $# -gt 0 ]; then
+        if [ "$BM_SCRIPT" = 1 ]; then
+          set -- "$@" -- /bin/sh "$APP_EXE"
+        else
+          set -- "$@" -- "$APP_EXE"
+        fi
         # shellcheck disable=SC2086
         exec unshare -m sh -c 'while [ "$1" != -- ]; do mount -o bind "$1" "$2" || exit 97; shift 2; done; shift
-          exec "$@"' sh "$@" -- "$APP_EXE" $BM_ARGS
+          exec "$@"' sh "$@" $BM_ARGS
       fi
+    fi
+    if [ "$BM_SCRIPT" = 1 ]; then
+      # shellcheck disable=SC2086
+      exec /bin/sh "$APP_EXE" $BM_ARGS
     fi
     # shellcheck disable=SC2086
     exec "$APP_EXE" $BM_ARGS
@@ -540,6 +549,7 @@ run_menu() {
 load_choice() {
   BM_KIND=""; BM_ID=""; BM_NAME=""; BM_SOURCE=""; BM_EXE=""; BM_DIR=""; BM_ARGS=""; BM_DATA=""; BM_CONF=""
   BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""; BM_ENCRYPTED=""; BM_OFFICIAL_BUILD=""; BM_GUI=""
+  BM_SCRIPT=""
   . "$STAGE/choice.sh"
 }
 

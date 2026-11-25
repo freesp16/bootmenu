@@ -158,7 +158,7 @@ int elf_compatible(const char *path, int encrypted, char *why, size_t whylen) {
         }
         if (type != 2 && type != 3) snprintf(why, whylen, "not an executable (e_type %u)", type);
         else if (type == 3 && !*interp) snprintf(why, whylen, "a shared library, not a program");
-        else if (flags & 0x400 /* EF_ARM_ABI_FLOAT_HARD */ || strstr(interp, "armhf"))
+        else if (((flags & 0x400 /* EF_ARM_ABI_FLOAT_HARD */) && *interp) || strstr(interp, "armhf"))
             snprintf(why, whylen, "hard-float (armhf) build; this unit runs armel");
         else if ((flags & 0xff000000u) != 0x05000000u && (flags & 0xff000000u) != 0x04000000u)
             snprintf(why, whylen, "not an EABI binary (e_flags 0x%08x)", flags);
@@ -326,6 +326,8 @@ static uint32_t accent_for(const char *id) {
 typedef struct {
     App *a;
     int hidden;
+    int explicit_exe;
+    int explicit_run_from;
 } IniCtx;
 
 static void app_kv(void *user, const char *k, const char *v) {
@@ -334,19 +336,42 @@ static void app_kv(void *user, const char *k, const char *v) {
     if (!strcmp(k, "name")) copy(a->name, sizeof a->name, v);
     else if (!strcmp(k, "description")) copy(a->desc, sizeof a->desc, v);
     else if (!strcmp(k, "exe")) {
+        x->explicit_exe = 1;
         if (*v == '/') copy(a->exe, sizeof a->exe, v);
         else snprintf(a->exe, sizeof a->exe, "%s/%s", a->dir, v);
     } else if (!strcmp(k, "args")) copy(a->args, sizeof a->args, v);
     else if (!strcmp(k, "data")) copy(a->data, sizeof a->data, v);
     else if (!strcmp(k, "conf")) copy(a->conf, sizeof a->conf, v);
     else if (!strcmp(k, "prefix")) copy(a->prefix, sizeof a->prefix, v);
-    else if (!strcmp(k, "run_from")) copy(a->run_from, sizeof a->run_from, !strcmp(v, "stick") ? "stick" : "ram");
+    else if (!strcmp(k, "run_from")) {
+        x->explicit_run_from = 1;
+        copy(a->run_from, sizeof a->run_from, !strcmp(v, "stick") ? "stick" : "ram");
+    }
     else if (!strcmp(k, "accent") && *v == '#') a->accent = (uint32_t)strtoul(v + 1, NULL, 16) & 0xffffff;
     else if (!strcmp(k, "hidden")) x->hidden = atoi(v);
     else if (!strcmp(k, "gui")) {
         if (!strcmp(v, "none") || *v == '/') copy(a->gui, sizeof a->gui, v);
         else snprintf(a->gui, sizeof a->gui, "%s/%s", a->dir, v);
     }
+}
+
+static int is_shell_script(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[129];
+    ssize_t r = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (r < 9) return 0;
+    buf[r] = 0;
+    if (!strncmp(buf, "#!/bin/sh", 9)) {
+        char c = buf[9];
+        return c == 0 || c == '\n' || c == '\r' || c == ' ' || c == '\t';
+    }
+    if (r >= 17 && !strncmp(buf, "#!/usr/bin/env sh", 17)) {
+        char c = buf[17];
+        return c == 0 || c == '\n' || c == '\r' || c == ' ' || c == '\t';
+    }
+    return 0;
 }
 
 /* The id of a file: its name without a trailing .bin / .elf / .app / .enc. */
@@ -419,12 +444,12 @@ static void finish_detail(App *a) {
 
 /* Adds the app if its executable is compatible (or it is still being unpacked). Settings come from `ini`. */
 static void consider(AppList *l, AppSource src, const char *id, const char *dir, const char *exe, const char *ini,
-                     int pending) {
+                     int pending, int allow_script) {
     if (l->n >= BM_MAX_APPS) return;
     App *a = &l->app[l->n];
     app_defaults(a, src, id, dir);
     if (exe) copy(a->exe, sizeof a->exe, exe);
-    IniCtx x = {a, 0};
+    IniCtx x = {a, 0, 0, 0};
     if (ini) read_kv(ini, app_kv, &x);
     if (x.hidden) return;
     a->ready = !pending;
@@ -440,31 +465,39 @@ static void consider(AppList *l, AppSource src, const char *id, const char *dir,
             l->skipped++;
             return;
         }
-        if (!probe_program(a->exe, (long long)st.st_size, &a->encrypted, why, sizeof why)) {
-            bm_log("apps: skip %s: %s", a->exe, why);
-            l->skipped++;
-            return;
-        }
-        a->size = (long long)st.st_size;
-        a->mtime = (long)st.st_mtime;
-        long long elf_bytes;
-        if (official_build(a->exe, a->encrypted, &elf_bytes)) {
-            /* the official application from the stick: where and how the installed one runs, its settings on the stick */
-            a->official_build = 1;
-            copy(a->dir, sizeof a->dir, "/root/pdj");
-            /* a release only when the file is exactly that program (plus, encrypted, the padding to 512 bytes): a
-             * modified one may carry more after its section headers */
-            long long whole = a->encrypted ? (elf_bytes + 511) / 512 * 512 : elf_bytes;
-            const char *v = whole == a->size ? release_for_size(elf_bytes) : NULL;
-            copy(a->version, sizeof a->version, v ? v : "");
-            if (a->accent == accent_for(a->id)) a->accent = OFFICIAL_ACCENT;
-            bm_log("apps: %s: the official SP-16 application%s, %s (program %lld bytes, file %lld)", a->exe,
-                   a->encrypted ? " (encrypted)" : "", v ? v : "unknown version", elf_bytes, a->size);
-        } else if (elf_appinfo(a)) {
-            bm_log("apps: %s: app info \"%s\" %s, icon %dx%d%s", a->exe, a->name, a->version, a->icon_w, a->icon_h,
-                   a->encrypted ? " (encrypted)" : "");
-        } else if (a->encrypted) {
-            bm_log("apps: %s: encrypted program", a->exe);
+        if (allow_script && x.explicit_exe && is_shell_script(a->exe)) {
+            a->is_script = 1;
+            if (!x.explicit_run_from) copy(a->run_from, sizeof a->run_from, "stick");
+            a->size = (long long)st.st_size;
+            a->mtime = (long)st.st_mtime;
+            bm_log("apps: %s: shell script launcher", a->exe);
+        } else {
+            if (!probe_program(a->exe, (long long)st.st_size, &a->encrypted, why, sizeof why)) {
+                bm_log("apps: skip %s: %s", a->exe, why);
+                l->skipped++;
+                return;
+            }
+            a->size = (long long)st.st_size;
+            a->mtime = (long)st.st_mtime;
+            long long elf_bytes;
+            if (official_build(a->exe, a->encrypted, &elf_bytes)) {
+                /* the official application from the stick: where and how the installed one runs, its settings on the stick */
+                a->official_build = 1;
+                copy(a->dir, sizeof a->dir, "/root/pdj");
+                /* a release only when the file is exactly that program (plus, encrypted, the padding to 512 bytes): a
+                 * modified one may carry more after its section headers */
+                long long whole = a->encrypted ? (elf_bytes + 511) / 512 * 512 : elf_bytes;
+                const char *v = whole == a->size ? release_for_size(elf_bytes) : NULL;
+                copy(a->version, sizeof a->version, v ? v : "");
+                if (a->accent == accent_for(a->id)) a->accent = OFFICIAL_ACCENT;
+                bm_log("apps: %s: the official SP-16 application%s, %s (program %lld bytes, file %lld)", a->exe,
+                       a->encrypted ? " (encrypted)" : "", v ? v : "unknown version", elf_bytes, a->size);
+            } else if (elf_appinfo(a)) {
+                bm_log("apps: %s: app info \"%s\" %s, icon %dx%d%s", a->exe, a->name, a->version, a->icon_w, a->icon_h,
+                       a->encrypted ? " (encrypted)" : "");
+            } else if (a->encrypted) {
+                bm_log("apps: %s: encrypted program", a->exe);
+            }
         }
         /* its own screen resources: gui= in its settings, else a folder <id>-gui beside it */
         if (!*a->gui) {
@@ -515,7 +548,7 @@ static void scan_files(AppList *l, const char *dir) {
         }
         id_from_file(id, sizeof id, e->d_name);
         snprintf(ini, sizeof ini, "%s/%s.ini", dir, id);
-        consider(l, SRC_STICK, id, dir, path, ini, 0);
+        consider(l, SRC_STICK, id, dir, path, ini, 0, 0);
     }
     closedir(d);
 }
@@ -537,7 +570,7 @@ static void scan_folders(AppList *l, const char *parent, AppSource src) {
         snprintf(pend, sizeof pend, "%s/.pending", dir);
         int pending = access(pend, F_OK) == 0;
         consider(l, src, e->d_name, dir, access(exe, F_OK) == 0 || pending ? exe : NULL,
-                 access(ini, F_OK) == 0 ? ini : NULL, pending);
+                 access(ini, F_OK) == 0 ? ini : NULL, pending, 1);
     }
     closedir(d);
 }
@@ -685,6 +718,7 @@ int apps_write_choice(const App *a, const char *path) {
     put(f, "BM_RUN_FROM", a->run_from);
     put(f, "BM_ENCRYPTED", a->encrypted ? "1" : "0");
     put(f, "BM_OFFICIAL_BUILD", a->official_build ? "1" : "0");
+    put(f, "BM_SCRIPT", a->is_script ? "1" : "0");
     put(f, "BM_GUI", a->gui);
     snprintf(num, sizeof num, "%lld", a->size);
     put(f, "BM_SIZE", num);

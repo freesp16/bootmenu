@@ -3,7 +3,8 @@
 ## What the menu runs
 
 A program is listed when it is a 32-bit little-endian ARM executable for the unit's userland: EABI, soft-float
-calling convention (**armel**), linked against glibc 2.13 or older. Hard-float (armhf) builds and other
+calling convention (**armel**), linked against glibc 2.13 or older. Static **armhf** executables (with no dynamic
+interpreter, e.g. `musl -static`) are also accepted alongside armel; dynamically linked armhf builds and other
 architectures are skipped, and `bootmenu.log` says why.
 
 Put it in one of these places on the stick:
@@ -13,6 +14,9 @@ Put it in one of these places on the stick:
 | `<stick>/<file>` | next to `autoexec.bin` |
 | `<stick>/apps/<file>` | in the apps folder |
 | `<stick>/apps/<id>/` | a folder app: an executable named `<id>`, or `exe=` in `app.ini` |
+
+A folder app (`apps/<id>/app.ini`) may also specify a POSIX `#!/bin/sh` launcher script via `exe=` (defaulting
+`run_from=stick`; stray `.sh` files outside `app.ini` remain ignored).
 
 The id is the file name without `.bin`, `.elf`, `.app` or `.enc`. The file name is free: the menu recognises programs
 by their content, not their name.
