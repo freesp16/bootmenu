@@ -749,8 +749,14 @@ case "${1:-help}" in
     [ -t 0 ] && die "send the binary on stdin: ssh root@UNIT ctl update [ID] < app"
     id=${2:-$(last_id)}
     [ -n "$id" ] && [ "$id" != official ] || die "name the app: ctl update ID < app"
-    new="$STAGE/update.$$"
-    cat > "$new" || { rm -f "$new"; die "upload failed (no room in /tmp?)"; }
+    grep -qF " $STAGE/run tmpfs " /proc/mounts 2>/dev/null \
+      || { mkdir -p "$STAGE/run" 2>/dev/null && mount -t tmpfs -o size=128m,mode=0755 tmpfs "$STAGE/run" 2>/dev/null; } || true
+    if [ -d "$STAGE/run" ] && [ -w "$STAGE/run" ]; then
+      new="$STAGE/run/update.$$"
+    else
+      new="$STAGE/update.$$"
+    fi
+    cat > "$new" || { rm -f "$new"; die "upload failed (no room in RAM?)"; }
     size=$(wc -c < "$new")
     dd if="$new" bs=4 count=1 2>/dev/null | grep -q ELF || { rm -f "$new"; die "the upload ($size bytes) is not an ELF file"; }
     # Where the stick copy lives: the app's own file when it is on the stick, else a new file beside autoexec.bin.
@@ -785,12 +791,21 @@ CTL
   fi
 
   # 5) Copy the embedded apps out of the image while the menu is already up (the hook unmounts it when we return).
-  #    RAM first; if /tmp is full, onto the stick (bootmenu-cache/), linked into place.
+  #    128 MB RAM disk first; if that fails, /tmp, else onto the stick (bootmenu-cache/), linked into place.
+  grep -qF " $STAGE/run tmpfs " /proc/mounts 2>/dev/null \
+    || { mkdir -p "$STAGE/run" 2>/dev/null && mount -t tmpfs -o size=128m,mode=0755 tmpfs "$STAGE/run" 2>/dev/null; } || true
   for d in "$SELF_DIR"/apps/*/; do
     [ -d "$d" ] || continue
     id=$(basename "$d")
     dst="$STAGE/apps/$id"
-    if cp -R "$d." "$dst/" 2>/dev/null; then
+    ram_dst="$STAGE/run/embedded/$id"
+    rm -rf "$ram_dst" 2>/dev/null
+    if mkdir -p "$STAGE/run/embedded" 2>/dev/null && cp -R "$d." "$ram_dst/" 2>/dev/null; then
+      rm -f "$ram_dst/.pending"
+      rm -rf "$dst"
+      ln -s "$ram_dst" "$dst"
+      echo "autoexec.sh: embedded app $id unpacked to RAM"
+    elif rm -rf "$ram_dst" 2>/dev/null && cp -R "$d." "$dst/" 2>/dev/null; then
       rm -f "$dst/.pending"
       echo "autoexec.sh: embedded app $id unpacked to RAM"
     else
