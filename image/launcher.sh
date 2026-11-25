@@ -182,7 +182,7 @@ read_conf() {
   return 0
 }
 if [ -f "$USB_RUN/bootmenu.conf" ]; then
-  read_conf "$USB_RUN/bootmenu.conf" BOOTMENU_ 'ssh*|cold_boot_wait_s'
+  read_conf "$USB_RUN/bootmenu.conf" BOOTMENU_ 'ssh*|cold_boot_wait_s|autostart'
   echo "runner: network settings from bootmenu.conf"
 elif read_conf "$USB_RUN/freesp16.conf" BOOTMENU_ 'ssh*'; then
   echo "runner: network settings from freesp16.conf (no bootmenu.conf)"
@@ -608,6 +608,10 @@ WATCHER_PID=$!
 # NEXT: menu (show it), run (resolve RUN_SPEC without the menu), app (run choice.sh), official, idle (wait for ctl).
 # ctl writes $STAGE/request ("menu", "run SPEC", "official", "stop") and stops the current child.
 NEXT=menu; MSG=""; RUN_SPEC=""; FALLBACK=""
+if [ "${BOOTMENU_AUTOSTART:-0}" = 1 ]; then
+  NEXT=run; RUN_SPEC=default
+  echo "runner: autostart=1; launching default entry directly"
+fi
 while :; do
   if [ -f "$STAGE/gone" ] || [ -f "$STAGE/poweroff" ]; then break; fi
   if [ -f "$STAGE/request" ]; then
@@ -638,7 +642,11 @@ while :; do
         load_choice
         if [ "$BM_KIND" = official ]; then NEXT=official; else NEXT=app; fi
       else
-        echo "runner: run: no app '$RUN_SPEC'"; NEXT=idle
+        if [ "$RUN_SPEC" = default ]; then
+          echo "runner: autostart: no default entry; showing the menu"; NEXT=menu
+        else
+          echo "runner: run: no app '$RUN_SPEC'"; NEXT=idle
+        fi
       fi
       ;;
     app)

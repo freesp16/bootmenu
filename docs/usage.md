@@ -25,6 +25,7 @@ The official software is always the first row, with the installed firmware versi
 
 ```
 default=last        # last | none | official | an app id (id@stick, id@embedded)
+autostart=0         # 1 = launch default entry immediately without showing the menu; returns to menu when it exits
 timeout=8           # seconds before the default starts; 0 = wait for you
 scan_root=1         # 0 = only look in apps/
 show_official=1     # 0 = hide the official software row
