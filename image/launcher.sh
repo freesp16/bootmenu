@@ -72,7 +72,7 @@ LOG="${USB:-/tmp}/bootmenu.log"
   fi
   rm -rf "$STAGE/apps" 2>/dev/null
   mkdir -p "$STAGE/bin" "$STAGE/apps" "$STAGE/run" 2>/dev/null
-  rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" 2>/dev/null
+  rm -f "$STAGE/gone" "$STAGE/poweroff" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" 2>/dev/null
 
   # 1) The small files first: the menu and the SSH server go to RAM before anything else.
   if ! cp "$SELF_DIR/bootmenu" "$STAGE/bin/bootmenu" 2>/dev/null; then
@@ -474,8 +474,11 @@ run_menu() {
   if [ $rc -eq 6 ]; then
     echo "runner: menu: the stick was pulled"; touch "$STAGE/gone"
   fi
+  if [ $rc -eq 9 ]; then
+    echo "runner: menu: power button requested standby"; touch "$STAGE/poweroff"
+  fi
   if [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] \
-     && { [ $rc -eq 2 ] || [ $rc -ge 128 ]; }; then
+     && [ ! -f "$STAGE/poweroff" ] && { [ $rc -eq 2 ] || [ $rc -ge 128 ]; }; then
     echo "runner: menu: gl-fb failed (rc=$rc); trying gl-x11"
     "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" --render x11 \
       --fallback ${MSG:+--message "$MSG"} </dev/null &
@@ -548,7 +551,7 @@ WATCHER_PID=$!
 # ctl writes $STAGE/request ("menu", "run SPEC", "official", "stop") and stops the current child.
 NEXT=menu; MSG=""; RUN_SPEC=""; FALLBACK=""
 while :; do
-  [ -f "$STAGE/gone" ] && break
+  if [ -f "$STAGE/gone" ] || [ -f "$STAGE/poweroff" ]; then break; fi
   if [ -f "$STAGE/request" ]; then
     read -r req arg < "$STAGE/request"; rm -f "$STAGE/request"
     echo "runner: ctl request: $req $arg"
@@ -563,7 +566,7 @@ while :; do
       if run_menu; then
         load_choice
         if [ "$BM_KIND" = official ]; then NEXT=official; else NEXT=app; fi
-      elif [ -f "$STAGE/request" ] || [ -f "$STAGE/gone" ]; then
+      elif [ -f "$STAGE/request" ] || [ -f "$STAGE/gone" ] || [ -f "$STAGE/poweroff" ]; then
         continue
       else
         echo "runner: no choice from the menu; giving the unit back to the official software"
@@ -613,12 +616,22 @@ done
 touch "$STAGE/runner.done"
 [ -f "$STAGE/gone" ] && exec >>"$STAGE/end.log" 2>&1 && echo "runner: $(now_s) s: the stick is gone"
 after_app
-if [ -f "$STAGE/gone" ]; then restore_once; else restore_official; fi   # first: the unit is usable again at once
-[ -f "$STAGE/gone" ] && wait "$WATCHER_PID" 2>/dev/null   # its recovery steps end up in the log before this one
+if [ -f "$STAGE/gone" ]; then
+  restore_once   # first: the unit is usable again at once
+  wait "$WATCHER_PID" 2>/dev/null   # its recovery steps end up in the log before this one
+elif [ -f "$STAGE/poweroff" ]; then
+  echo "runner: standby requested; halting without restarting official software"
+else
+  restore_official   # first: the unit is usable again at once
+fi
 stop_ssh
 rm -f "$STAGE/runner.pid" "$STAGE/state"
 echo "runner: session over"
 sync
+if [ ! -f "$STAGE/gone" ] && [ -f "$STAGE/poweroff" ]; then
+  sleep 3
+  poweroff 2>/dev/null || halt 2>/dev/null || true
+fi
 RUNNER
   chmod 0755 "$STAGE/run.sh"
 

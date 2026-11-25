@@ -119,16 +119,22 @@ int backlight_level(int step);               /* 1..5 -> the driver's level, as t
 int backlight_wake(const char *settings, char *info, size_t infolen);
 
 /* ---- panel link (panel.c) ------------------------------------------------------------------------------------- */
-typedef enum { IN_NONE, IN_TURN, IN_PUSH, IN_BACK, IN_HOME, IN_TOUCH_DOWN, IN_TOUCH_UP } InputKind;
+typedef enum { IN_NONE, IN_TURN, IN_PUSH, IN_BACK, IN_HOME, IN_TOUCH_DOWN, IN_TOUCH_UP, IN_POWER } InputKind;
 typedef struct {
     InputKind kind;
     int value;  /* IN_TURN: detents (+ = clockwise) */
     int x, y;   /* touch: screen pixels (800 x 480) */
 } InputEvent;
+void panel_set_path(const char *path);       /* override /dev/subucom_spi0.1 (NULL/empty restores default) */
+void panel_reset(void);                      /* reset decoder/debounce state without clobbering path or fd */
 int panel_open(char *info, size_t infolen);  /* 0 = running */
 int panel_fd(void);                          /* -1 when closed */
+/* Decodes a single 128-byte RX frame (header 0x01 + CRC-16/X-25); returns event count, or -1 if invalid. */
+int panel_decode_frame(const uint8_t *frame, InputEvent *out, int max);
 /* Reads every frame that is ready (non-blocking) and appends decoded events; returns the count added. */
 int panel_poll(InputEvent *out, int max);
+/* Sends HardMute + Standby ACK TX frames to the panel MCU, syncs, waits >= 8 ms, stops timer and closes fd. */
+int panel_standby_ack(char *info, size_t infolen);
 void panel_close(void);                      /* timer off, close: the device is idle for the next owner */
 
 /* ---- graphics (gfx.c) ----------------------------------------------------------------------------------------- */

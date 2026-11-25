@@ -5,6 +5,7 @@
  *   bootmenu --stick DIR [--embedded DIR] --list
  *   bootmenu --decrypt FILE [--key KEYFILE]           (an encrypted program, decrypted, on stdout)
  *   bootmenu --wake-backlight [--settings FILE]       (the LCD back to the official app's brightness, then exit)
+ *   bootmenu --standby-ack [--panel PATH]             (send HardMute + Standby ACK to the panel MCU, then exit)
  *
  * Start-up order (every step logged with its time, "BOOTMENU <ms> ..."):
  *   1. SIGTERM to the official app            it shuts down while we do 2 and 3
@@ -19,8 +20,9 @@
  * Exit codes: 0 a choice was written to --out; 2 graphics failed (the launcher runs us again with --render x11
  * --fallback); 3 graphics failed and --fallback wrote the default (or official) choice; 4 nothing could be chosen;
  * 5 stopped by a signal or q (no choice); 6 the stick was pulled (the launcher starts the official app at once); 1 usage;
- * 7 --decrypt failed; 8 --wake-backlight could not set the backlight. --key: the unit's key file for encrypted programs
- * (default BM_KEY). --settings: the official app's settings file, for its LCD BRIGHTNESS (default BM_SETTINGS). */
+ * 7 --decrypt failed; 8 --wake-backlight could not set the backlight; 9 power button standby requested;
+ * 10 --standby-ack failed. --key: the unit's key file for encrypted programs (default BM_KEY). --settings: the
+ * official app's settings file, for its LCD BRIGHTNESS (default BM_SETTINGS). --panel: override panel device path. */
 #define _GNU_SOURCE
 #include "bm.h"
 
@@ -96,18 +98,19 @@ static void usage(void) {
             "Boot menu " BM_VERSION "\n"
             "usage: bootmenu --stick DIR [--embedded DIR] [--conf FILE] [--out FILE]\n"
             "                [--render fb|x11|host] [--fallback] [--message TEXT] [--no-official-stop]\n"
-            "                [--screenshot FILE.ppm] [--exit-after FRAMES] [--keys KEYS]\n"
+            "                [--screenshot FILE.ppm] [--exit-after FRAMES] [--keys KEYS] [--panel PATH]\n"
             "       bootmenu --stick DIR [--embedded DIR] --resolve SPEC|default [--out FILE]\n"
             "       bootmenu --stick DIR [--embedded DIR] --list\n"
             "       bootmenu --decrypt FILE [--key KEYFILE]\n"
             "       bootmenu --wake-backlight [--settings FILE]\n"
+            "       bootmenu --standby-ack [--panel PATH]\n"
             "       bootmenu --version\n");
 }
 
 typedef struct {
     Config cfg;
-    const char *conf, *out, *render, *message, *resolve, *shot, *keys, *decrypt, *settings;
-    int fallback, list, no_official_stop, exit_after, wake_backlight;
+    const char *conf, *out, *render, *message, *resolve, *shot, *keys, *decrypt, *settings, *panel;
+    int fallback, list, no_official_stop, exit_after, wake_backlight, standby_ack;
 } Args;
 
 static int parse(Args *a, int argc, char **argv) {
@@ -130,12 +133,14 @@ static int parse(Args *a, int argc, char **argv) {
         if (!strcmp(k, "--keys")) { VAL(a->keys) }
         if (!strcmp(k, "--decrypt")) { VAL(a->decrypt) }
         if (!strcmp(k, "--settings")) { VAL(a->settings) }
+        if (!strcmp(k, "--panel")) { VAL(a->panel) }
         if (!strcmp(k, "--key")) { if (!v) return -1; snprintf(a->cfg.key, sizeof a->cfg.key, "%s", v); i++; continue; }
         if (!strcmp(k, "--exit-after")) { if (!v) return -1; a->exit_after = atoi(v); i++; continue; }
         if (!strcmp(k, "--fallback")) { a->fallback = 1; continue; }
         if (!strcmp(k, "--list")) { a->list = 1; continue; }
         if (!strcmp(k, "--no-official-stop")) { a->no_official_stop = 1; continue; }
         if (!strcmp(k, "--wake-backlight")) { a->wake_backlight = 1; continue; }
+        if (!strcmp(k, "--standby-ack")) { a->standby_ack = 1; continue; }
         if (!strcmp(k, "--help") || !strcmp(k, "-h")) return -1;
         if (!strcmp(k, "--version")) {
             printf("bootmenu %s\n", BM_VERSION);
@@ -203,6 +208,7 @@ int main(int argc, char **argv) {
         usage();
         return 1;
     }
+    if (a.panel) panel_set_path(a.panel);
     /* An encrypted program, decrypted to stdout: the launcher writes it to RAM and runs it. */
     if (a.decrypt) {
         if (!crypt_key_load(a.cfg.key)) return 7;
@@ -210,6 +216,12 @@ int main(int argc, char **argv) {
     }
     /* The launcher's path without the menu (ctl run): the official app was stopped by the launcher. */
     if (a.wake_backlight) return restore_backlight(&a) == 0 ? 0 : 8;
+    if (a.standby_ack) {
+        char info[200];
+        int ok = panel_standby_ack(info, sizeof info) == 0;
+        bm_log("%s", info);
+        return ok ? 0 : 10;
+    }
     char conf[320];
     if (a.conf) snprintf(conf, sizeof conf, "%s", a.conf);
     else snprintf(conf, sizeof conf, "%s/bootmenu.conf", a.cfg.stick);
@@ -287,7 +299,7 @@ int main(int argc, char **argv) {
     int key_step = 0, shot_taken = 0;
     double last_draw = 0, last_rescan = bm_now();
     int x11 = strcmp(a.render, "fb") != 0;
-    int pulled = 0;
+    int pulled = 0, poweroff = 0;
     double last_stick_check = 0;
     while (!stop_requested && !quit) {
         double t = bm_now();
@@ -302,6 +314,14 @@ int main(int argc, char **argv) {
         int n = panel_poll(ev, 64);
         if (x11) n += x11_poll(ev + n, 64 - n, &quit);
         if (n < 64 && scripted(a.keys, t - t_start, &key_step, &ev[n])) n++;
+        for (int i = 0; i < n; i++) {
+            if (ev[i].kind == IN_POWER) {
+                bm_log("panel: power button pressed (standby requested)");
+                poweroff = 1;
+                break;
+            }
+        }
+        if (poweroff) break;
         int action = MENU_IDLE;
         for (int i = 0; i < n && action == MENU_IDLE; i++) {
             if (waiting_unpack) continue; /* the choice is made; only waiting for the copy */
@@ -351,6 +371,21 @@ int main(int argc, char **argv) {
             if (x11 && x11_fd() >= 0) p[np++] = (struct pollfd){x11_fd(), POLLIN, 0};
             poll(p, (nfds_t)np, 50);
         }
+    }
+
+    if (poweroff) {
+        for (int k = 0; k < 2; k++) {
+            menu_tick(m, bm_now());
+            menu_draw_launch(m, "Powering off\xE2\x80\xA6");
+            if (a.shot && k == 1 && !shot_taken) gfx_screenshot(a.shot);
+            gfx_end();
+        }
+        panel_standby_ack(info, sizeof info);
+        bm_log("%s", info);
+        panel_close();
+        gfx_close();
+        bm_log("exit rc=9 after %ld frames", frame);
+        return 9;
     }
 
     int rc = pulled ? 6 : 5;
