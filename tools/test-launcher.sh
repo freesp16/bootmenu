@@ -102,6 +102,16 @@ cp /work/apps/my_fw $S/my_fw
 mkdir -p $S/my_fw-gui/Resource         # only what differs: one changed file, one new one
 echo "mod skin" > $S/my_fw-gui/Resource/skin.txt
 echo "mod added" > $S/my_fw-gui/Resource/added.txt
+mkdir -p $S/apps/scriptapp
+printf 'name=Script App\nexe=run.sh\nargs=--flag\n' > $S/apps/scriptapp/app.ini
+cat > $S/apps/scriptapp/run.sh <<'SCR'
+#!/bin/sh
+echo "SCRIPTAPP argc=$# arg1=${1:--} id=$BOOTMENU_APP_ID"
+mkdir -p /root/data/scriptapp
+echo "ok" > /root/data/scriptapp/written-by-script
+exit 0
+SCR
+chmod 0755 $S/apps/scriptapp/run.sh
 printf 'default=hello\ntimeout=3\nssh=0\n' > $S/bootmenu.conf
 printf 'greeting=hi there\n' > $S/hello.conf
 
@@ -149,6 +159,15 @@ pidof EP085_Main_R >/dev/null && echo "PASS official app running again" || { ech
 CTL=/tmp/bootmenu/ctl.sh
 sh $CTL list > /tmp/list.txt 2>&1; cat /tmp/list.txt
 check "ctl list shows the stick app" "crashy@stick" /tmp/list.txt
+check "ctl list shows scriptapp" "scriptapp@stick" /tmp/list.txt
+[ ! -f /tmp/bootmenu/httpd.pid ] && echo "PASS http=0 default does not start httpd" || { echo "FAIL httpd.pid exists when http=0"; fail=1; }
+sh $CTL run scriptapp
+wait_for "runner: scriptapp exited" $L 20
+wait_for "runner: menu exited" $L 10
+check "scriptapp ran via /bin/sh with args and BOOTMENU_APP_ID" "SCRIPTAPP argc=1 arg1=--flag id=scriptapp" $L
+check "scriptapp exited rc=0" "runner: scriptapp exited rc=0" $L
+[ -f $S/scriptapp-data/scriptapp/written-by-script ] && echo "PASS scriptapp wrote data to stick" || { echo "FAIL no scriptapp data on stick"; fail=1; }
+[ -f /root/data/scriptapp/written-by-script ] && { echo "FAIL scriptapp wrote to unit /root/data"; fail=1; } || echo "PASS scriptapp did not write to unit /root/data"
 sh $CTL run crashy
 wait_for "runner: crashy exited" $L 20
 check "a failing app is reported" "crashy stopped right away (exit code 3" $L
@@ -265,6 +284,26 @@ check "non-empty MSG resolves official on gl-x11 crash" "gl-x11 failed without a
 check "wrapper recorded --resolve official" "WRAPPER_RESOLVE .*--resolve official" /tmp/wrapper.log
 pidof EP085_Main_R >/dev/null && echo "PASS official app running after MSG fallback" || { echo "FAIL official app not running after MSG fallback"; fail=1; }
 
+echo "--- autostart=1 (direct default launch without graphical menu)"
+stop_runner_clean
+pidof EP085_Main_R >/dev/null || ( cd /root/pdj && ./EP085_Main_R </dev/null >/dev/null 2>&1 & )
+printf 'default=hello\nautostart=1\nssh=0\n' > $S/bootmenu.conf
+rm -f $S/bootmenu.log
+sh /work/iso/autoexec.sh $S
+L=$S/bootmenu.log
+wait_for "runner: hello exited" $L 20
+wait_for "runner: menu exited" $L 15
+check "autostart=1 logged direct launch" "runner: autostart=1; launching default entry directly" $L
+check "autostart=1 launched hello" "runner: launching hello:" $L
+l_app=$(grep -n "runner: launching hello:" $L | head -n 1 | cut -d: -f1)
+l_menu=$(grep -n "^runner: menu" $L | head -n 1 | cut -d: -f1)
+l_exit=$(grep -n "runner: hello exited" $L | head -n 1 | cut -d: -f1)
+if [ -n "$l_app" ] && [ -n "$l_menu" ] && [ -n "$l_exit" ] && [ "$l_app" -lt "$l_menu" ] && [ "$l_exit" -lt "$l_menu" ]; then
+  echo "PASS autostart=1 skipped menu before launch and transitioned to menu after exit"
+else
+  echo "FAIL autostart=1 sequence (app=$l_app exit=$l_exit menu=$l_menu)"; fail=1
+fi
+
 echo "--- poweroff standby path (rc=9)"
 stop_runner_clean
 killall -TERM EP085_Main_R 2>/dev/null || true
@@ -299,6 +338,106 @@ pidof EP085_Main_R >/dev/null && { echo "FAIL rc=9 restarted official software";
   && echo "PASS rc=9 stopped dropbear.pid" || { echo "FAIL rc=9 left dropbear.pid running"; fail=1; }
 [ -f /tmp/poweroff.called ] && echo "PASS rc=9 invoked poweroff/halt" || { echo "FAIL rc=9 did not invoke poweroff/halt"; fail=1; }
 rm -rf /tmp/iso_crash /tmp/iso_pwr /tmp/wrapper.log /tmp/poweroff.called $B/poweroff $B/halt
+
+echo "--- http=1 status bridge and CGI endpoints"
+stop_runner_clean
+( cd /root/pdj && ./EP085_Main_R </dev/null >/dev/null 2>&1 & )
+sleep 1
+has_real_httpd=0
+if command -v httpd >/dev/null 2>&1 || { command -v busybox >/dev/null 2>&1 && busybox httpd --help >/dev/null 2>&1; }; then
+  has_real_httpd=1
+else
+  printf '#!/bin/sh\nexec sleep 60\n' > $B/httpd && chmod 0755 $B/httpd
+fi
+printf 'ssh=0\nhttp=1\nhttp_port=18080\n' > $S/bootmenu.conf
+rm -f $S/bootmenu.log
+sh /work/iso/autoexec.sh $S
+L=$S/bootmenu.log
+i=0; while { [ ! -f /tmp/bootmenu/run/www/index.html ] || [ ! -f /tmp/bootmenu/httpd.pid ]; } && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done
+[ -f /tmp/bootmenu/run/www/index.html ] && echo "PASS start_http created index.html" || { echo "FAIL no /tmp/bootmenu/run/www/index.html"; fail=1; }
+check "index.html contains canvas" "<canvas" /tmp/bootmenu/run/www/index.html
+if grep -q "169\.254\.16\.16" /tmp/bootmenu/run/www/index.html; then
+  echo "FAIL index.html hardcoded 169.254.16.16"; fail=1
+else
+  echo "PASS index.html does not hardcode 169.254.16.16"
+fi
+
+sh /tmp/bootmenu/run/www/cgi-bin/status.cgi > /tmp/cgi_status.out
+check "status.cgi sets Cache-Control: no-store" "^Cache-Control: no-store" /tmp/cgi_status.out
+check "status.cgi sets X-Content-Type-Options: nosniff" "^X-Content-Type-Options: nosniff" /tmp/cgi_status.out
+/usr/bin/python3 - <<'PY' || fail=1
+import json
+raw = open("/tmp/cgi_status.out", "rb").read()
+hdr, body = raw.split(b"\r\n\r\n", 1)
+data = json.loads(body.decode("utf-8"))
+req = {"state", "runner_pid", "child_pid", "official_pid", "uptime_s", "mem_free_kb", "carrier", "ip"}
+missing = req - set(data.keys())
+assert not missing, f"missing keys: {missing}"
+print("PASS status.cgi valid JSON keys:", sorted(data.keys()))
+PY
+
+orig_log_path=$(cat /tmp/bootmenu/log.path)
+/usr/bin/python3 - <<'PY'
+open("/tmp/big.log", "w").write("".join(f"line {i}\n" for i in range(1, 601)))
+PY
+echo "/tmp/big.log" > /tmp/bootmenu/log.path
+QUERY_STRING="lines=5" sh /tmp/bootmenu/run/www/cgi-bin/log.cgi > /tmp/cgi_log5.out
+QUERY_STRING="lines=99999" sh /tmp/bootmenu/run/www/cgi-bin/log.cgi > /tmp/cgi_logmax.out
+QUERY_STRING="lines=1;id" sh /tmp/bootmenu/run/www/cgi-bin/log.cgi > /tmp/cgi_loginj.out
+echo "$orig_log_path" > /tmp/bootmenu/log.path
+/usr/bin/python3 - <<'PY' || fail=1
+def body_lines(p):
+    _, b = open(p, "rb").read().split(b"\r\n\r\n", 1)
+    return b.decode("utf-8").splitlines()
+l5 = body_lines("/tmp/cgi_log5.out")
+lmax = body_lines("/tmp/cgi_logmax.out")
+linj = body_lines("/tmp/cgi_loginj.out")
+assert len(l5) == 5, f"lines=5 gave {len(l5)}"
+assert len(lmax) == 500, f"lines=99999 gave {len(lmax)}"
+assert len(linj) == 100 and not any("uid=" in x for x in linj), f"lines=1;id gave {len(linj)}"
+print("PASS log.cgi lines=5, lines=99999->500 clamp, lines=1;id->100 safe fallback")
+PY
+
+BOOTMENU_FB0=/tmp/missing-fb0 sh /tmp/bootmenu/run/www/cgi-bin/fb0.cgi > /tmp/cgi_fb_miss.out
+check "fb0.cgi returns 404 when missing" "^Status: 404 Not Found" /tmp/cgi_fb_miss.out
+dd if=/dev/zero of=/tmp/fake_fb0 bs=1024 count=750 2>/dev/null
+BOOTMENU_FB0=/tmp/fake_fb0 sh /tmp/bootmenu/run/www/cgi-bin/fb0.cgi > /tmp/cgi_fb_ok.out
+check "fb0.cgi sets Content-Length: 768000" "^Content-Length: 768000" /tmp/cgi_fb_ok.out
+/usr/bin/python3 - <<'PY' || fail=1
+_, b = open("/tmp/cgi_fb_ok.out", "rb").read().split(b"\r\n\r\n", 1)
+assert len(b) == 768000, f"expected 768000 bytes, got {len(b)}"
+print("PASS fb0.cgi streamed exact 768000 bytes")
+PY
+
+if [ "$has_real_httpd" = 1 ]; then
+  /usr/bin/python3 - <<'PY' || fail=1
+import json, urllib.request, urllib.error
+base = "http://127.0.0.1:18080"
+with urllib.request.urlopen(base + "/", timeout=5) as r:
+    assert r.status == 200 and b"<canvas" in r.read()
+with urllib.request.urlopen(base + "/cgi-bin/status.cgi", timeout=5) as r:
+    assert r.status == 200
+    assert r.headers.get("Cache-Control") == "no-store"
+    assert r.headers.get("X-Content-Type-Options") == "nosniff"
+    data = json.loads(r.read().decode("utf-8"))
+    assert "state" in data and "runner_pid" in data
+with urllib.request.urlopen(base + "/cgi-bin/log.cgi?lines=5", timeout=5) as r:
+    assert r.status == 200 and len(r.read().decode("utf-8").splitlines()) == 5
+try:
+    urllib.request.urlopen(base + "/cgi-bin/fb0.cgi", timeout=5)
+except urllib.error.HTTPError as e:
+    assert e.code == 404
+print("PASS live busybox httpd requests on 127.0.0.1:18080")
+PY
+fi
+
+httpd_pid=$(cat /tmp/bootmenu/httpd.pid 2>/dev/null || true)
+umount -l $S; rm -f /dev/fakestick
+wait_for "runner: session over" /tmp/bootmenu/end.log 20
+[ -n "$httpd_pid" ] && ! kill -0 "$httpd_pid" 2>/dev/null && [ ! -f /tmp/bootmenu/httpd.pid ] \
+  && echo "PASS stop_http terminated httpd.pid" || { echo "FAIL httpd.pid still alive or present"; fail=1; }
+[ "$has_real_httpd" = 0 ] && rm -f $B/httpd
+rm -f /tmp/big.log /tmp/fake_fb0 /tmp/cgi_*.out
 exit $fail
 TEST
 

@@ -29,6 +29,8 @@ C
   $cc -o /t/progs/demo /t/demo.c
   # a stand-in for the official application: built with the RPATH of its build tree
   $cc -Wl,--disable-new-dtags -Wl,-rpath,/usr/X11R6/lib/:/home/iMX6/ltib/rootfs/usr/lib/ -o /t/progs/official /t/plain.c
+  $cc -static -o /t/stick/static_hf /t/plain.c
+  $cc -o /t/stick/dyn_hf /t/plain.c
   cc -o /t/stick/native /t/plain.c              # an x86-64 program: must be skipped
 
   cat > /t/panel_preload.c <<'"'"'PRELOAD'"'"'
@@ -401,6 +403,18 @@ rec = lambda i, v: struct.pack("<i", i) + bytes(0x84) + struct.pack("<i", v)
 open(sys.argv[1], "wb").write(bytes.fromhex("8f9e7b2a04000100") + rec(3, 2) + rec(5, int(sys.argv[2])) + rec(6, 32))' "$@"; }
 settings "$t/settings.dat" 5
 settings "$t/settings-bad.dat" 9
+python3 -c 'import struct, sys
+for p in sys.argv[1:]:
+    b = bytearray(open(p, "rb").read())
+    f = (struct.unpack_from("<I", b, 36)[0] & ~0x200) | 0x400
+    struct.pack_into("<I", b, 36, f)
+    open(p, "wb").write(b)' "$t/stick/static_hf" "$t/stick/dyn_hf"
+mkdir -p "$t/stick/apps/scriptapp"
+printf 'name=Script App\nexe=run.sh\nargs=--flag\n' > "$t/stick/apps/scriptapp/app.ini"
+printf '#!/bin/sh\necho SCRIPT_OK\n' > "$t/stick/apps/scriptapp/run.sh"
+printf '#!/bin/sh\necho stray\n' > "$t/stick/stray.sh"
+printf '#!/bin/sh\necho loose\n' > "$t/stick/apps/loose.sh"
+chmod 0755 "$t/stick/apps/scriptapp/run.sh" "$t/stick/stray.sh" "$t/stick/apps/loose.sh"
 
 # 3) the tests
 docker run --rm --user "$(id -u):$(id -g)" -v "$here":/work:ro -v "$t":/t "$image" sh -eu -c '
@@ -470,4 +484,13 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$here":/work:ro -v "$t":/t "$imag
   run --stick $t/stick --key $t/test.key --list > /dev/null 2> $t/cal_ok
   if grep -q "ignoring invalid touch_cal" $t/cal_ok; then echo "FAIL valid touch_cal warned"; cat $t/cal_ok; fail=1
   else echo "PASS valid touch_cal accepted without warning"; fi
+  check "static armhf ELF is listed" "^static_hf@stick" $t/list
+  check "dynamic armhf ELF is skipped with reason" "dyn_hf: hard-float (armhf) build; this unit runs armel" $t/log
+  if grep -q "^dyn_hf@stick" $t/list; then echo "FAIL dynamic armhf was listed"; fail=1; else echo "PASS dynamic armhf not listed"; fi
+  check "script folder app is listed" "^scriptapp@stick	Script App" $t/list
+  if grep -q "stray\.sh\|loose\.sh" $t/list $t/log; then echo "FAIL stray script was treated as an app"; fail=1
+  else echo "PASS stray scripts outside explicit folder app are ignored"; fi
+  run --stick $t/stick --key $t/test.key --resolve scriptapp --out $t/script.sh 2>/dev/null
+  check "script app sets BM_SCRIPT=1" "^BM_SCRIPT=.1.$" $t/script.sh
+  check "script app defaults to BM_RUN_FROM=stick" "^BM_RUN_FROM=.stick.$" $t/script.sh
   exit $fail'
