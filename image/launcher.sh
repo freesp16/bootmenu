@@ -170,12 +170,24 @@ log_holders() {
 # read_conf FILE PREFIX [KEY_PATTERN]: export PREFIX<KEY>=value for each key=value line (keys a-z0-9_).
 read_conf() {
   [ -f "$1" ] || return 1
+  _rc_pats=""
+  [ -n "${3:-}" ] && _rc_pats=$(printf '%s' "$3" | tr '|' ' ')
   while IFS= read -r line || [ -n "$line" ]; do
     line=$(printf '%s' "$line" | tr -d '\r')
     case "$line" in ''|'#'*) continue;; esac
     key=${line%%=*}; val=${line#*=}
     case "$key" in *[!a-z0-9_]*|'') continue;; esac
-    if [ -n "$3" ]; then case "$key" in $3) ;; *) continue;; esac; fi
+    if [ -n "$_rc_pats" ]; then
+      _rc_ok=0; _rc_rem="$_rc_pats"
+      while [ -n "$_rc_rem" ]; do
+        _rc_pat=${_rc_rem%% *}
+        if [ -n "$_rc_pat" ]; then
+          case "$key" in $_rc_pat) _rc_ok=1; break ;; esac
+        fi
+        case "$_rc_rem" in *' '*) _rc_rem=${_rc_rem#* } ;; *) _rc_rem="" ;; esac
+      done
+      [ "$_rc_ok" = 1 ] || continue
+    fi
     var=$2$(printf '%s' "$key" | tr 'a-z' 'A-Z')
     export "$var=$val"
   done < "$1"
