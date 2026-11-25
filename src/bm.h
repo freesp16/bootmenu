@@ -165,6 +165,7 @@ int gfx_screenshot(const char *path); /* the next frame (at gfx_end) as a binary
 void gfx_close(void);         /* fb backend: leaves the shown frame on buffer 0 so the X server's view is coherent */
 
 /* ---- X11 window (x11.c): gl-x11 on the unit, the host development window ------------------------------------- */
+int x11_hold_cursor(long runner);
 int x11_open(int w, int h, int fullscreen, char *err, size_t errlen);
 void *x11_display(void);
 unsigned long x11_window(void);

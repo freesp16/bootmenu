@@ -351,6 +351,7 @@ standby() {
       printf "%s\n" standby > "$STAGE/state"
       echo "runner: standby: boot volume released; requesting panel standby"
       "$menu" --standby </dev/null
+      release_shutdown_cursor
       echo "runner: panel standby returned while the unit was still on"
       rm -f "$STAGE/standby-in-progress" "$STAGE/runner.pid"
       stop_ssh
@@ -463,6 +464,18 @@ seed_official_data() {
   touch "$1/.bootmenu-seeded"
 }
 
+CURSOR_GUARD_PID=""
+release_shutdown_cursor() {
+  if [ -n "$CURSOR_GUARD_PID" ]; then
+    # A failed X connection may already have ended the helper.
+    if [ "$(awk '$1 == "PPid:" {print $2}' "/proc/$CURSOR_GUARD_PID/status" 2>/dev/null)" = "$$" ]; then
+      kill "$CURSOR_GUARD_PID" 2>/dev/null || :
+    fi
+    wait "$CURSOR_GUARD_PID" 2>/dev/null || :
+    CURSOR_GUARD_PID=""
+  fi
+}
+
 # Starts the chosen app (choice.sh is sourced) in the background; APP_PID = its pid.
 launch_app() {
   app_binary || { echo "runner: ERROR $BM_ID could not be decrypted (no key on this unit, or no room)"; return 1; }
@@ -500,6 +513,11 @@ launch_app() {
     case "$DATA" in
       "$USB_RUN"/*) receipt_dir=$(mktemp -d "$STAGE/power.XXXXXX") || receipt_dir="" ;;
     esac
+  fi
+  # freesp16 hides the pointer itself until its window disappears.
+  if [ "$BM_ID" = freesp16 ] && [ -n "$receipt_dir" ]; then
+    "$STAGE/bin/bootmenu" --hold-cursor "$$" </dev/null >"$STAGE/cursor.log" 2>&1 &
+    CURSOR_GUARD_PID=$!
   fi
   echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}${APP_GUI:+, /root/gui = $APP_GUI}, $MOUNT_MODE)"
   (
@@ -654,6 +672,9 @@ while :; do
       echo "runner: $BM_ID pid $APP_PID"
       ( sleep 5; log_holders "5 s after launching $BM_ID" ) >> "$STAGE/helpers.log" 2>&1 &
       wait "$APP_PID"; rc=$?
+      if [ -n "$CURSOR_GUARD_PID" ]; then
+        cat "$STAGE/cursor.log"
+      fi
       rm -f "$STAGE/child.pid"
       if [ -n "$receipt_dir" ]; then
         saved=0
@@ -663,6 +684,7 @@ while :; do
           standby
         fi
       fi
+      release_shutdown_cursor
       after_app
       t1=$(cut -d. -f1 /proc/uptime)
       echo "runner: $BM_ID exited rc=$rc after $((t1 - t0)) s"
