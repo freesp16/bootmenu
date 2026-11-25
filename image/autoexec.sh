@@ -4,6 +4,11 @@
 # real launcher (launcher.sh) with every message, parse errors included, in bootmenu.log on the stick.
 L="${1:-/tmp}/bootmenu.log"
 echo "=== autoexec.sh stub: hook ran $(date 2>/dev/null) args: $*" >> "$L"
+if [ -n "${1:-}" ] && { [ -e "$1/SP16_SAFE_MODE" ] || [ -e "$1/bootmenu.disable" ]; }; then
+  echo "stub: safe mode flag present on $1; leaving official software untouched" >> "$L"
+  sync
+  exit 0
+fi
 D=$(dirname "$0")
 case "$D" in /*) ;; *) D="$(pwd)/$D";; esac
 echo "stub: dir=$D pwd=$(pwd) uid=$(id -u 2>/dev/null) ppid=$PPID parent=$(tr '\000' ' ' < /proc/$PPID/cmdline 2>/dev/null)" >> "$L"
