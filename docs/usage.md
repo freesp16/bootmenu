@@ -32,6 +32,8 @@ show_official=1     # 0 = hide the official software row
 official_wait_ms=8000
 cold_boot_wait_s=25 # seconds to wait for cold-boot startup (apl_start); 0 = off
 touch_cal=rawLeft,rawRight,rawTop,rawBottom # optional raw resistive touch bounds override
+http=0              # 1 = enable read-only status & framebuffer HTTP bridge via BusyBox httpd (off by default)
+http_port=8080      # port for the read-only HTTP bridge when http=1
 ```
 
 ## When things happen

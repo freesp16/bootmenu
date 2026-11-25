@@ -182,7 +182,7 @@ read_conf() {
   return 0
 }
 if [ -f "$USB_RUN/bootmenu.conf" ]; then
-  read_conf "$USB_RUN/bootmenu.conf" BOOTMENU_ 'ssh*|cold_boot_wait_s|autostart'
+  read_conf "$USB_RUN/bootmenu.conf" BOOTMENU_ 'ssh*|cold_boot_wait_s|autostart|http|http_port'
   echo "runner: network settings from bootmenu.conf"
 elif read_conf "$USB_RUN/freesp16.conf" BOOTMENU_ 'ssh*'; then
   echo "runner: network settings from freesp16.conf (no bootmenu.conf)"
@@ -237,7 +237,9 @@ add_alias() {
 }
 
 setup_network() {
-  [ "${BOOTMENU_SSH:-1}" = 0 ] && { echo "runner: net: off (ssh=0)"; return 0; }
+  if [ "${BOOTMENU_SSH:-1}" = 0 ] && [ "${BOOTMENU_HTTP:-0}" != 1 ]; then
+    echo "runner: net: off (ssh=0, http=0)"; return 0
+  fi
   [ -e "/sys/class/net/$NET_IF" ] || { echo "runner: net: no $NET_IF on this unit"; return 1; }
   ifconfig "$NET_IF" up 2>/dev/null || ip link set "$NET_IF" up 2>/dev/null
   if [ "$SSH_IP" = none ]; then echo "runner: net: no alias address (ssh_ip=none)"
@@ -320,6 +322,185 @@ stop_ssh() {
   if [ -n "$dp" ]; then kill -TERM "$dp" 2>/dev/null; else killall -TERM dropbear 2>/dev/null; fi
   p=$(cat "$STAGE/udhcpc.pid" 2>/dev/null); [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
   rm -f "$STAGE/dropbear.pid" "$STAGE/udhcpc.pid"
+}
+
+# --- HTTP status bridge (opt-in, read-only) ---------------------------------------------------------------------------
+start_http() {
+  [ "${BOOTMENU_HTTP:-0}" = 1 ] || return 0
+  http_port=${BOOTMENU_HTTP_PORT:-8080}
+  case "$http_port" in
+    ''|*[!0-9]*) http_port=8080 ;;
+    *) [ "$http_port" -ge 1 ] && [ "$http_port" -le 65535 ] || http_port=8080 ;;
+  esac
+  HTTPD_BIN=""
+  if command -v httpd >/dev/null 2>&1; then
+    HTTPD_BIN="httpd"
+  elif command -v busybox >/dev/null 2>&1 && busybox httpd --help >/dev/null 2>&1; then
+    HTTPD_BIN="busybox httpd"
+  fi
+  if [ -z "$HTTPD_BIN" ]; then
+    echo "runner: http: no httpd applet available"
+    return 1
+  fi
+  run_ramdisk
+  if [ -d "$STAGE/run" ] && [ -w "$STAGE/run" ]; then
+    WWW="$STAGE/run/www"
+  else
+    WWW="$STAGE/www"
+  fi
+  mkdir -p "$WWW/cgi-bin" || { echo "runner: http: could not create $WWW"; return 1; }
+  printf '%s\n' "$SSH_IP" > "$STAGE/http.ip"
+
+  cat > "$WWW/index.html" <<'HTTP_HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bootmenu Status</title>
+<style>
+  body { margin: 0; padding: 16px; background: #111318; color: #e6e9ef; font: 14px/1.4 monospace; }
+  h1 { margin: 0 0 8px; font-size: 16px; }
+  .meta { color: #9aa4b2; margin-bottom: 12px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+  canvas { border: 1px solid #2b313d; background: #000; max-width: 100%; height: auto; }
+  pre { margin: 0; padding: 10px; background: #181c24; border: 1px solid #2b313d; overflow: auto; max-height: 480px; }
+  .panel { flex: 1 1 320px; min-width: 280px; }
+</style>
+</head>
+<body>
+<h1>Bootmenu Status (<span id="host"></span>)</h1>
+<div class="meta">Read-only status &amp; framebuffer view</div>
+<div class="grid">
+  <div><canvas id="fb" width="800" height="480"></canvas></div>
+  <div class="panel">
+    <pre id="status">loading status...</pre>
+    <pre id="log" style="margin-top:12px;">loading log...</pre>
+  </div>
+</div>
+<script>
+document.getElementById('host').textContent = window.location.host;
+const fb = document.getElementById('fb');
+const ctx = fb.getContext('2d');
+const img = ctx.createImageData(800, 480);
+
+async function refreshFb() {
+  try {
+    const r = await fetch('/cgi-bin/fb0.cgi', { cache: 'no-store' });
+    if (!r.ok) return;
+    const buf = await r.arrayBuffer();
+    if (buf.byteLength < 768000) return;
+    const src = new Uint8Array(buf, 0, 768000);
+    const dst = img.data;
+    for (let i = 0, p = 0; i < 384000; i++, p += 2) {
+      const px = src[p] | (src[p + 1] << 8);
+      const r5 = (px >> 11) & 0x1f;
+      const g6 = (px >> 5) & 0x3f;
+      const b5 = px & 0x1f;
+      const o = i * 4;
+      dst[o]     = (r5 << 3) | (r5 >> 2);
+      dst[o + 1] = (g6 << 2) | (g6 >> 4);
+      dst[o + 2] = (b5 << 3) | (b5 >> 2);
+      dst[o + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  } catch (e) {}
+}
+
+async function refreshText() {
+  try {
+    const [s, l] = await Promise.all([
+      fetch('/cgi-bin/status.cgi', { cache: 'no-store' }),
+      fetch('/cgi-bin/log.cgi?lines=80', { cache: 'no-store' })
+    ]);
+    if (s.ok) document.getElementById('status').textContent = JSON.stringify(await s.json(), null, 2);
+    if (l.ok) document.getElementById('log').textContent = await l.text();
+  } catch (e) {}
+}
+
+refreshFb();
+refreshText();
+setInterval(refreshFb, 1000);
+setInterval(refreshText, 2000);
+</script>
+</body>
+</html>
+HTTP_HTML
+
+  cat > "$WWW/cgi-bin/status.cgi" <<'HTTP_STATUS'
+#!/bin/sh
+STAGE=/tmp/bootmenu
+esc() { printf '%s' "$1" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+state=$(cat "$STAGE/state" 2>/dev/null)
+runner_pid=$(cat "$STAGE/runner.pid" 2>/dev/null)
+child_pid=$(cat "$STAGE/child.pid" 2>/dev/null)
+official_pid=""
+for p in $(pidof EP085_Main_R 2>/dev/null); do
+  s=$(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null)
+  if [ -n "$s" ] && [ "$s" != Z ]; then official_pid="$p"; break; fi
+done
+uptime_s=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+mem_free_kb=$(awk '/^MemAvailable:/ {print $2; found=1; exit} /^MemFree:/ {mf=$2} END {if (!found && mf) print mf}' /proc/meminfo 2>/dev/null)
+carrier=$(cat /sys/class/net/eth0/carrier 2>/dev/null)
+ip=$(ifconfig eth0:16 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -n 1)
+[ -n "$ip" ] || ip=$(cat "$STAGE/http.ip" 2>/dev/null)
+printf 'Status: 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n'
+printf '{"state":"%s","runner_pid":"%s","child_pid":"%s","official_pid":"%s","uptime_s":"%s","mem_free_kb":"%s","carrier":"%s","ip":"%s"}\n' \
+  "$(esc "$state")" "$(esc "$runner_pid")" "$(esc "$child_pid")" "$(esc "$official_pid")" \
+  "$(esc "$uptime_s")" "$(esc "$mem_free_kb")" "$(esc "$carrier")" "$(esc "$ip")"
+HTTP_STATUS
+
+  cat > "$WWW/cgi-bin/log.cgi" <<'HTTP_LOG'
+#!/bin/sh
+STAGE=/tmp/bootmenu
+LOG_FILE=$(cat "$STAGE/log.path" 2>/dev/null)
+[ -n "$LOG_FILE" ] || LOG_FILE=/tmp/bootmenu.log
+lines=100
+case "${QUERY_STRING:-}" in
+  *lines=*)
+    raw=${QUERY_STRING#*lines=}
+    raw=${raw%%&*}
+    case "$raw" in
+      ''|*[!0-9]*) lines=100 ;;
+      *) lines=$raw ;;
+    esac
+    ;;
+esac
+if [ "${#lines}" -gt 4 ]; then lines=500
+elif [ "$lines" -lt 1 ] 2>/dev/null; then lines=1
+elif [ "$lines" -gt 500 ] 2>/dev/null; then lines=500; fi
+printf 'Status: 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n'
+tail -n "$lines" "$LOG_FILE" 2>/dev/null || true
+HTTP_LOG
+
+  cat > "$WWW/cgi-bin/fb0.cgi" <<'HTTP_FB0'
+#!/bin/sh
+FB=${BOOTMENU_FB0:-/dev/fb0}
+if [ ! -r "$FB" ]; then
+  printf 'Status: 404 Not Found\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\nframebuffer not available\n'
+  exit 0
+fi
+printf 'Status: 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 768000\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n'
+dd if="$FB" bs=4096 count=188 2>/dev/null | head -c 768000
+HTTP_FB0
+
+  chmod 0755 "$WWW/cgi-bin/status.cgi" "$WWW/cgi-bin/log.cgi" "$WWW/cgi-bin/fb0.cgi"
+  # shellcheck disable=SC2086
+  $HTTPD_BIN -f -p "0.0.0.0:$http_port" -h "$WWW" </dev/null &
+  http_pid=$!
+  sleep 1
+  if kill -0 "$http_pid" 2>/dev/null; then
+    echo "$http_pid" > "$STAGE/httpd.pid"
+    echo "runner: http: listening on 0.0.0.0:$http_port (pid $http_pid, read-only)"
+  else
+    echo "runner: http: ERROR httpd exited at start"
+  fi
+}
+
+stop_http() {
+  hp=$(cat "$STAGE/httpd.pid" 2>/dev/null)
+  [ -n "$hp" ] && kill -TERM "$hp" 2>/dev/null
+  rm -f "$STAGE/httpd.pid"
 }
 
 # --- Apps' /root/data off NAND -----------------------------------------------------------------------------------------
@@ -560,8 +741,8 @@ cd "$STAGE" 2>/dev/null || cd /tmp
 
 wait_cold_boot
 
-# Network and SSH beside the menu, never in front of it.
-( setup_network; start_ssh ) &
+# Network, SSH and optional read-only HTTP bridge beside the menu, never in front of it.
+( setup_network; start_ssh; start_http ) &
 
 # Watcher: the stick's block device disappearing ends the session; every 5 s the alias address is put back.
 DEV=$(awk -v m="$USB_RUN" '$2 == m { print $1; exit }' /proc/mounts 2>/dev/null)
@@ -595,8 +776,8 @@ echo "runner: watching stick device ${DEV:-unknown}"
       exit 0
     fi
     tick=$((tick+1))
-    if [ $((tick % 5)) -eq 0 ] && [ "${BOOTMENU_SSH:-1}" != 0 ] && [ "$SSH_IP" != none ] \
-       && [ -e "/sys/class/net/$NET_IF" ] && ! alias_present; then
+    if [ $((tick % 5)) -eq 0 ] && { [ "${BOOTMENU_SSH:-1}" != 0 ] || [ "${BOOTMENU_HTTP:-0}" = 1 ]; } \
+       && [ "$SSH_IP" != none ] && [ -e "/sys/class/net/$NET_IF" ] && ! alias_present; then
       add_alias && echo "runner: net: $NET_IF:16 = $SSH_IP put back"
     fi
     sleep 1
@@ -691,6 +872,7 @@ else
   restore_official   # first: the unit is usable again at once
 fi
 stop_ssh
+stop_http
 rm -f "$STAGE/runner.pid" "$STAGE/state"
 echo "runner: session over"
 sync
@@ -755,6 +937,7 @@ case "${1:-help}" in
     p=$(cat "$STAGE/child.pid" 2>/dev/null); [ -n "$p" ] && echo "child     pid $p ($(cat /proc/$p/comm 2>/dev/null))"
     s=$(pidof EP085_Main_R 2>/dev/null); echo "official app ${s:-not running}"
     d=$(cat "$STAGE/dropbear.pid" 2>/dev/null); echo "ssh       ${d:+pid $d}${d:-not running}"
+    h=$(cat "$STAGE/httpd.pid" 2>/dev/null); echo "http      ${h:+pid $h}${h:-not running}"
     echo "last      $(cat "$USB/bootmenu.last" 2>/dev/null)"
     echo "carrier   $(cat /sys/class/net/eth0/carrier 2>/dev/null || echo '?')"
     ifconfig 2>/dev/null | awk '/^[a-z]/ { i = $1 } /inet addr:/ { sub("addr:", "", $2); print "address   " i " " $2 }'
