@@ -79,11 +79,12 @@ stick while they run. When it exits, the menu comes back.
 ```
 name=My App
 description=What it does
+exe=myapp              # folder app.ini only: executable or POSIX #!/bin/sh launcher script
 args=--fullscreen
 data=myapp-data        # none = no /root/data redirect
 conf=myapp.conf
 prefix=MYAPP_
-run_from=ram           # ram (copied to /tmp first) or stick
+run_from=ram           # ram (copied to RAM disk first) or stick (default for #!/bin/sh scripts)
 accent=#4f8cff
 hidden=1
 gui=my-resources       # files for /root/gui (default: <id>-gui/ when it exists; none = never)

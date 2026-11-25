@@ -15,6 +15,14 @@ All notable changes to this project are listed here. The format follows
   before taking over, returning immediately on hot-plug.
 - Optional resistive touchscreen calibration override (`touch_cal=rawLeft,rawRight,rawTop,rawBottom`) in
   `bootmenu.conf`.
+- Static **armhf** executables (with no dynamic interpreter, e.g. `musl -static`) alongside armel, and explicit POSIX
+  `#!/bin/sh` launcher scripts via `exe=` in folder `app.ini` (defaulting `run_from=stick`; stray `.sh` files outside
+  `app.ini` remain ignored).
+- Opt-in `autostart=1` in `bootmenu.conf` to launch the default entry directly without showing the menu, returning to
+  the menu when the app exits or if no default entry resolves.
+- Opt-in read-only HTTP status bridge (`http=1`, `http_port=8080` in `bootmenu.conf`, off by default) via BusyBox
+  `httpd` serving a relative-URL status/log/framebuffer viewer (`index.html`, `/cgi-bin/status.cgi`,
+  `/cgi-bin/log.cgi`, `/cgi-bin/fb0.cgi`) and keeping `eth0:16` up even when `ssh=0`.
 
 ### Fixed
 - Fall back to `--resolve default` (or `official` when an error message is active) when `gl-x11` crashes without
@@ -23,6 +31,10 @@ All notable changes to this project are listed here. The format follows
   `/tmp` filesystem.
 - Bind Dropbear explicitly to IPv4 (`0.0.0.0:<port>` when no address is given), scope SSH teardown to
   `$STAGE/dropbear.pid`, and match `/proc/mounts` paths literally with `grep -qF`.
+
+### Changed
+- `launch_app()` executes `BM_SCRIPT=1` folder-app scripts under `/bin/sh` in both mount-namespace (`unshare -m`) and
+  global bind-mount modes.
 
 ## [1.1.0] - 2026-11-24
 

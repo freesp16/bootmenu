@@ -46,8 +46,12 @@ http_port=8080      # port for the read-only HTTP bridge when http=1
 - **Safe mode (`SP16_SAFE_MODE` or `bootmenu.disable`):** creating either file at the root of the stick bypasses the
   boot menu and leaves the official software untouched (logged in `bootmenu.log`).
 
-## Development images: SSH
+## Development images: SSH and HTTP status bridge
 
 An image built with `--ssh-dropbear` and `--ssh-keys` (see [development.md](development.md)) also starts an SSH
 server on the LINK port at `169.254.16.16` (key login only). `ctl help` lists the remote commands (`ctl menu`,
-`ctl run ID`, `ctl update ID < file`, `ctl log`). Release images have no SSH server.
+`ctl run ID`, `ctl update ID < file`, `ctl log`, `ctl status`). Release images have no SSH server.
+
+Setting `http=1` in `bootmenu.conf` (opt-in, `0` by default) starts a read-only BusyBox `httpd` bridge on
+`http_port=8080` serving a live status/log/framebuffer view (`index.html`, `/cgi-bin/status.cgi`,
+`/cgi-bin/log.cgi`, `/cgi-bin/fb0.cgi`) and keeps `eth0:16` up even when `ssh=0`.

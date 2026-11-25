@@ -34,6 +34,10 @@ tools/build-image.py --key key.file --ssh-dropbear dropbearmulti --ssh-keys ~/.s
 The device key is never committed (`*.key` is ignored). The key can come from `--key FILE`, `BOOTMENU_AES_KEY`
 (the line itself) or `BOOTMENU_AES_KEY_FILE`.
 
+See [usage.md](usage.md) for `bootmenu.conf` options (`autostart=1`, `cold_boot_wait_s=25`, `touch_cal=`, opt-in
+read-only `http=1` on `http_port=8080`, and `SP16_SAFE_MODE`) and [apps.md](apps.md) for supported binary/script
+formats (armel, static armhf, and `exe=` POSIX shell scripts in folder apps).
+
 ## CI and releases
 
 - **CI** (`.github/workflows/ci.yml`, every push and pull request): shell and Python checks, the armel build with
