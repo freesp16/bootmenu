@@ -198,6 +198,11 @@ static int scripted(const char *keys, double age, int *next, InputEvent *e) {
 int main(int argc, char **argv) {
     t_start = bm_now();
     setvbuf(stderr, NULL, _IOLBF, 0);
+    if (argc == 3 && strcmp(argv[1], "--hold-cursor") == 0)
+        return x11_hold_cursor(strtol(argv[2], NULL, 10));
+    if (argc == 2 && !strcmp(argv[1], "--standby")) {
+        return panel_request_standby();
+    }
     static Args a;
     if (parse(&a, argc, argv) != 0) {
         usage();
