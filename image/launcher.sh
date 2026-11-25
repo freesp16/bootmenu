@@ -297,13 +297,14 @@ start_ssh() {
   fi
   chmod 0600 "$KEYS/host_key"
   "$STAGE/bin/dropbearkey" -y -f "$KEYS/host_key" 2>/dev/null | sed -n 's/^Fingerprint: /runner: ssh: host key fingerprint /p'
-  if ! grep -q ' /dev/pts ' /proc/mounts 2>/dev/null; then
+  if ! grep -qF ' /dev/pts ' /proc/mounts 2>/dev/null; then
     mkdir -p /dev/pts 2>/dev/null
     mount -t devpts devpts /dev/pts 2>/dev/null && echo "runner: ssh: mounted /dev/pts" \
       || echo "runner: ssh: WARNING no /dev/pts: commands work, interactive terminals do not (use ssh -T)"
   fi
   port=${BOOTMENU_SSH_PORT:-22}
-  PATH="$STAGE/bin:$PATH" "$STAGE/bin/dropbear" -F -E -s -r "$KEYS/host_key" -D "$KEYS" -p "$port" -K 15 </dev/null &
+  case "$port" in *:*) ssh_bind="$port";; *) ssh_bind="0.0.0.0:$port";; esac
+  PATH="$STAGE/bin:$PATH" "$STAGE/bin/dropbear" -F -E -s -r "$KEYS/host_key" -D "$KEYS" -p "$ssh_bind" -K 15 </dev/null &
   ssh_pid=$!
   sleep 1
   if kill -0 "$ssh_pid" 2>/dev/null; then
@@ -315,7 +316,8 @@ start_ssh() {
 }
 
 stop_ssh() {
-  killall -TERM dropbear 2>/dev/null
+  dp=$(cat "$STAGE/dropbear.pid" 2>/dev/null)
+  if [ -n "$dp" ]; then kill -TERM "$dp" 2>/dev/null; else killall -TERM dropbear 2>/dev/null; fi
   p=$(cat "$STAGE/udhcpc.pid" 2>/dev/null); [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
   rm -f "$STAGE/dropbear.pid" "$STAGE/udhcpc.pid"
 }
@@ -364,7 +366,7 @@ now_s() { cut -d' ' -f1 /proc/uptime; }
 # application handles USB storage itself). Without the RAM disk, /tmp is used as before.
 RUN_RAM_SIZE=128m
 run_ramdisk() {
-  grep -q " $STAGE/run tmpfs " /proc/mounts 2>/dev/null && return 0
+  grep -qF " $STAGE/run tmpfs " /proc/mounts 2>/dev/null && return 0
   mkdir -p "$STAGE/run"
   if mount -t tmpfs -o size=$RUN_RAM_SIZE,mode=0755 tmpfs "$STAGE/run" 2>/dev/null; then
     echo "runner: RAM disk for apps: $STAGE/run ($RUN_RAM_SIZE)"
@@ -557,7 +559,7 @@ echo "runner: watching stick device ${DEV:-unknown}"
 (
   tick=0
   while [ ! -f "$STAGE/runner.done" ]; do
-    if { [ -n "$DEV" ] && [ ! -b "$DEV" ]; } || { [ -n "$DEV" ] && ! grep -q " $USB_RUN " /proc/mounts; }; then
+    if { [ -n "$DEV" ] && [ ! -b "$DEV" ]; } || { [ -n "$DEV" ] && ! grep -qF " $USB_RUN " /proc/mounts; }; then
       # The session ends here, whatever the runner is doing: stop the app or menu, undo the mounts, start the official
       # software. The log goes to RAM (shown in bootmenu.log at the next insertion).
       touch "$STAGE/gone"

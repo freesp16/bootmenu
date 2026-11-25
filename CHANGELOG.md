@@ -6,6 +6,24 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Physical POWER button handling with Sub-MCU Standby ACK handshake: pressing POWER/STANDBY exits the menu with
+  `rc=9` and halts cleanly without restarting the official software.
+- Rescue safe mode flag on the USB stick: creating `SP16_SAFE_MODE` or `bootmenu.disable` at the root of the stick
+  bypasses the boot menu and leaves the official software untouched.
+- Configurable cold-boot wait (`cold_boot_wait_s=25`, `0 = off`) in `bootmenu.conf` to wait for stock `apl_start`
+  before taking over, returning immediately on hot-plug.
+- Optional resistive touchscreen calibration override (`touch_cal=rawLeft,rawRight,rawTop,rawBottom`) in
+  `bootmenu.conf`.
+
+### Fixed
+- Fall back to `--resolve default` (or `official` when an error message is active) when `gl-x11` crashes without
+  producing a choice.
+- Stage `ctl update` uploads and unpacked embedded apps in the 128 MB `$STAGE/run` RAM disk instead of the small
+  `/tmp` filesystem.
+- Bind Dropbear explicitly to IPv4 (`0.0.0.0:<port>` when no address is given), scope SSH teardown to
+  `$STAGE/dropbear.pid`, and match `/proc/mounts` paths literally with `grep -qF`.
+
 ## [1.1.0] - 2026-11-24
 
 ### Added

@@ -35,6 +35,7 @@ typedef struct {
     int show_official;       /* 1 = list the official software */
     int official_wait_ms;    /* how long the official app may take to exit after SIGTERM before SIGKILL */
     char key[256];           /* the unit's key file, for encrypted programs (--key; default BM_KEY) */
+    int touch_cal[4];        /* rawLeft, rawRight, rawTop, rawBottom */
 } Config;
 void config_defaults(Config *c);
 void config_load(Config *c, const char *path); /* missing file = defaults */
@@ -126,6 +127,7 @@ typedef struct {
     int x, y;   /* touch: screen pixels (800 x 480) */
 } InputEvent;
 void panel_set_path(const char *path);       /* override /dev/subucom_spi0.1 (NULL/empty restores default) */
+void panel_set_touch_cal(int left, int right, int top, int bottom); /* override LCD touch raw calibration */
 void panel_reset(void);                      /* reset decoder/debounce state without clobbering path or fd */
 int panel_open(char *info, size_t infolen);  /* 0 = running */
 int panel_fd(void);                          /* -1 when closed */

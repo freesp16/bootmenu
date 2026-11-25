@@ -76,6 +76,10 @@ void config_defaults(Config *c) {
     c->show_official = 1;
     c->official_wait_ms = 8000;
     copy(c->key, sizeof c->key, BM_KEY);
+    c->touch_cal[0] = 940;
+    c->touch_cal[1] = 72;
+    c->touch_cal[2] = 87;
+    c->touch_cal[3] = 866;
 }
 
 static void config_kv(void *user, const char *k, const char *v) {
@@ -85,6 +89,18 @@ static void config_kv(void *user, const char *k, const char *v) {
     else if (!strcmp(k, "scan_root")) c->scan_root = atoi(v);
     else if (!strcmp(k, "show_official") || !strcmp(k, "show_stock")) c->show_official = atoi(v);
     else if (!strcmp(k, "official_wait_ms") || !strcmp(k, "stock_wait_ms")) c->official_wait_ms = atoi(v);
+    else if (!strcmp(k, "touch_cal")) {
+        int l = 0, r = 0, t = 0, b = 0;
+        if (sscanf(v, "%d,%d,%d,%d", &l, &r, &t, &b) == 4 &&
+            abs(l - r) >= 100 && abs(b - t) >= 100) {
+            c->touch_cal[0] = l;
+            c->touch_cal[1] = r;
+            c->touch_cal[2] = t;
+            c->touch_cal[3] = b;
+        } else {
+            bm_log("config: ignoring invalid touch_cal '%s'", v);
+        }
+    }
     /* network keys (ssh=, ssh_ip=, ...) belong to the launcher */
 }
 

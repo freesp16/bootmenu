@@ -226,6 +226,7 @@ int main(int argc, char **argv) {
     if (a.conf) snprintf(conf, sizeof conf, "%s", a.conf);
     else snprintf(conf, sizeof conf, "%s/bootmenu.conf", a.cfg.stick);
     config_load(&a.cfg, conf);
+    panel_set_touch_cal(a.cfg.touch_cal[0], a.cfg.touch_cal[1], a.cfg.touch_cal[2], a.cfg.touch_cal[3]);
     static AppList apps;
 
     /* No screen: --list prints, --resolve writes a choice (the launcher's `ctl run ID` and the headless path). */

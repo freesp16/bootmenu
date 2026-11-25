@@ -48,6 +48,7 @@ struct subucom_ioc_transfer {
 typedef char subucom_ioc_size_check[sizeof(struct subucom_ioc_transfer) == 16 ? 1 : -1];
 
 static char panel_path_buf[256];
+static int cal_left = 940, cal_right = 72, cal_top = 87, cal_bottom = 866;
 
 static struct {
     int fd;
@@ -66,6 +67,15 @@ static const char *panel_path_get(void) {
 void panel_set_path(const char *path) {
     if (path && *path) snprintf(panel_path_buf, sizeof panel_path_buf, "%s", path);
     else panel_path_buf[0] = '\0';
+}
+
+void panel_set_touch_cal(int left, int right, int top, int bottom) {
+    if (abs(left - right) >= 100 && abs(bottom - top) >= 100) {
+        cal_left = left;
+        cal_right = right;
+        cal_top = top;
+        cal_bottom = bottom;
+    }
 }
 
 void panel_reset(void) {
@@ -183,8 +193,14 @@ static int decode(const uint8_t *f, InputEvent *out, int n, int max) {
     if (P.touch_good && (abs(rx - P.last_rx) > 48 || abs(ry - P.last_ry) > 48) && !P.touch_down) P.touch_good = 0;
     P.touch_good++;
     P.last_rx = rx, P.last_ry = ry;
-    int x = (int)((940 - rx) * 720.0 / 868.0 + (rx <= 940 ? 0.5 : -0.5)) + 40;
-    int y = (int)((ry - 87) * 405.0 / 779.0 + (ry >= 87 ? 0.5 : -0.5)) + 29;
+    double dx = (double)(cal_left - cal_right);
+    double dy = (double)(cal_bottom - cal_top);
+    double sx = (cal_left - rx) * 720.0 / dx;
+    double sy = (ry - cal_top) * 405.0 / dy;
+    int x = (int)(sx + (sx >= 0 ? 0.5 : -0.5)) + 40;
+    int y = (int)(sy + (sy >= 0 ? 0.5 : -0.5)) + 29;
+    if (x < 0) x = 0; else if (x > 799) x = 799;
+    if (y < 0) y = 0; else if (y > 479) y = 479;
     P.tx = x, P.ty = y;
     if (!P.touch_down && P.touch_good >= 3) {
         P.touch_down = 1;
