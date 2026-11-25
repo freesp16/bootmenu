@@ -338,9 +338,18 @@ start_http() {
   elif command -v busybox >/dev/null 2>&1 && busybox httpd --help >/dev/null 2>&1; then
     HTTPD_BIN="busybox httpd"
   fi
+  NC_BIN=""
   if [ -z "$HTTPD_BIN" ]; then
-    echo "runner: http: no httpd applet available"
-    return 1
+    echo "runner: http: BusyBox httpd not available, trying nc"
+    if command -v nc >/dev/null 2>&1; then
+      NC_BIN="nc"
+    elif command -v busybox >/dev/null 2>&1 && { busybox nc --help >/dev/null 2>&1 || busybox --list 2>/dev/null | grep -qx nc; }; then
+      NC_BIN="busybox nc"
+    fi
+    if [ -z "$NC_BIN" ]; then
+      echo "runner: http: no httpd or nc applet available"
+      return 1
+    fi
   fi
   run_ramdisk
   if [ -d "$STAGE/run" ] && [ -w "$STAGE/run" ]; then
@@ -370,9 +379,9 @@ start_http() {
 </head>
 <body>
 <h1>Bootmenu Status (<span id="host"></span>)</h1>
-<div class="meta">Read-only status &amp; framebuffer view</div>
+<div class="meta" id="meta">Read-only status &amp; framebuffer view</div>
 <div class="grid">
-  <div><canvas id="fb" width="800" height="480"></canvas></div>
+  <div id="fb-wrap"><canvas id="fb" width="800" height="480"></canvas></div>
   <div class="panel">
     <pre id="status">loading status...</pre>
     <pre id="log" style="margin-top:12px;">loading log...</pre>
@@ -380,13 +389,26 @@ start_http() {
 </div>
 <script>
 document.getElementById('host').textContent = window.location.host;
+const fbWrap = document.getElementById('fb-wrap');
 const fb = document.getElementById('fb');
 const ctx = fb.getContext('2d');
 const img = ctx.createImageData(800, 480);
+let fbDisabled = false;
+let fbTimer = null;
+
+function disableFb() {
+  if (fbDisabled) return;
+  fbDisabled = true;
+  if (fbTimer) { clearInterval(fbTimer); fbTimer = null; }
+  if (fbWrap) fbWrap.style.display = 'none';
+  document.getElementById('meta').textContent = 'Read-only status & log view (framebuffer disabled in nc fallback)';
+}
 
 async function refreshFb() {
+  if (fbDisabled) return;
   try {
     const r = await fetch('/cgi-bin/fb0.cgi', { cache: 'no-store' });
+    if (r.headers.get('X-Server') === 'nc-fallback') { disableFb(); return; }
     if (!r.ok) return;
     const buf = await r.arrayBuffer();
     if (buf.byteLength < 768000) return;
@@ -409,19 +431,25 @@ async function refreshFb() {
 
 async function refreshText() {
   try {
-    const [s, l] = await Promise.all([
-      fetch('/cgi-bin/status.cgi', { cache: 'no-store' }),
-      fetch('/cgi-bin/log.cgi?lines=80', { cache: 'no-store' })
-    ]);
+    const s = await fetch('/cgi-bin/status.cgi', { cache: 'no-store' });
+    if (s.headers.get('X-Server') === 'nc-fallback') disableFb();
     if (s.ok) document.getElementById('status').textContent = JSON.stringify(await s.json(), null, 2);
+  } catch (e) {}
+  try {
+    const l = await fetch('/cgi-bin/log.cgi?lines=80', { cache: 'no-store' });
+    if (l.headers.get('X-Server') === 'nc-fallback') disableFb();
     if (l.ok) document.getElementById('log').textContent = await l.text();
   } catch (e) {}
 }
 
-refreshFb();
-refreshText();
-setInterval(refreshFb, 1000);
-setInterval(refreshText, 2000);
+(async function init() {
+  await refreshText();
+  if (!fbDisabled) {
+    await refreshFb();
+    if (!fbDisabled) fbTimer = setInterval(refreshFb, 1000);
+  }
+  setInterval(refreshText, 2000);
+})();
 </script>
 </body>
 </html>
@@ -485,16 +513,79 @@ dd if="$FB" bs=4096 count=188 2>/dev/null | head -c 768000
 HTTP_FB0
 
   chmod 0755 "$WWW/cgi-bin/status.cgi" "$WWW/cgi-bin/log.cgi" "$WWW/cgi-bin/fb0.cgi"
-  # shellcheck disable=SC2086
-  $HTTPD_BIN -f -p "0.0.0.0:$http_port" -h "$WWW" </dev/null &
-  http_pid=$!
-  sleep 1
-  if kill -0 "$http_pid" 2>/dev/null; then
-    echo "$http_pid" > "$STAGE/httpd.pid"
-    echo "runner: http: listening on 0.0.0.0:$http_port (pid $http_pid, read-only)"
+  if [ -n "$HTTPD_BIN" ]; then
+    # shellcheck disable=SC2086
+    $HTTPD_BIN -f -p "0.0.0.0:$http_port" -h "$WWW" </dev/null &
+    http_pid=$!
+    sleep 1
+    if kill -0 "$http_pid" 2>/dev/null; then
+      echo "$http_pid" > "$STAGE/httpd.pid"
+      echo "runner: http: listening on 0.0.0.0:$http_port (pid $http_pid, read-only)"
+    else
+      echo "runner: http: ERROR httpd exited at start"
+    fi
   else
-    echo "runner: http: ERROR httpd exited at start"
+    FIFO="$WWW/http.fifo"
+    rm -f "$FIFO"
+    if ! mkfifo "$FIFO" 2>/dev/null; then
+      echo "runner: http: ERROR could not create $FIFO for nc fallback"
+      return 1
+    fi
+    (
+      nc_pid=""
+      trap 'kill "$nc_pid" 2>/dev/null; rm -f "$FIFO"; exit 0' TERM INT
+      while [ ! -f "$STAGE/runner.done" ]; do
+        # shellcheck disable=SC2086
+        http_serve_once < "$FIFO" | $NC_BIN -l -p "$http_port" > "$FIFO" 2>/dev/null &
+        nc_pid=$!
+        wait "$nc_pid" 2>/dev/null || sleep 1
+        nc_pid=""
+      done
+      rm -f "$FIFO"
+    ) </dev/null &
+    http_pid=$!
+    echo "$http_pid" > "$STAGE/httpd.pid"
+    echo "runner: http: no httpd; using nc fallback on port $http_port"
   fi
+}
+
+http_serve_once() {
+  IFS= read -r req_line || return 1
+  cr=$(printf '\r')
+  req_line=${req_line%"$cr"}
+  while IFS= read -r hdr; do
+    hdr=${hdr%"$cr"}
+    [ -z "$hdr" ] && break
+  done
+  method=${req_line%% *}
+  rest=${req_line#* }
+  path=${rest%% *}
+  if [ "$method" != GET ] && [ "$method" != HEAD ]; then
+    printf 'HTTP/1.0 405 Method Not Allowed\r\nX-Server: nc-fallback\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nread-only\n'
+    return 0
+  fi
+  case "$path" in
+    /cgi-bin/status.cgi*)
+      printf 'HTTP/1.0 200 OK\r\nX-Server: nc-fallback\r\nConnection: close\r\n'
+      "$WWW/cgi-bin/status.cgi" | awk 'NR==1 && /^Status:/ {next} {print}'
+      ;;
+    /cgi-bin/log.cgi*)
+      qs=""
+      case "$path" in
+        *\?*) qs=${path#*\?} ;;
+      esac
+      printf 'HTTP/1.0 200 OK\r\nX-Server: nc-fallback\r\nConnection: close\r\n'
+      QUERY_STRING="$qs" "$WWW/cgi-bin/log.cgi" | awk 'NR==1 && /^Status:/ {next} {print}'
+      ;;
+    /cgi-bin/fb0.cgi*)
+      printf 'HTTP/1.0 404 Not Found\r\nX-Server: nc-fallback\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nframebuffer not available in nc fallback\n'
+      ;;
+    *)
+      len=$(wc -c < "$WWW/index.html" 2>/dev/null)
+      printf 'HTTP/1.0 200 OK\r\nX-Server: nc-fallback\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %s\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n' "${len:-0}"
+      [ "$method" = HEAD ] || cat "$WWW/index.html"
+      ;;
+  esac
 }
 
 stop_http() {
