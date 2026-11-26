@@ -18,6 +18,11 @@ All notable changes to this project are listed here. The format follows
 - A screen drawn by the CPU (`--render cpu`) when the GPU cannot draw the menu. On the DJS-1000
   it comes right after the framebuffer, since the GPU's X11 window stays black there.
 
+- Standby from an app that has saved: it writes the receipt named in `BOOTMENU_STANDBY_READY` and exits with status 76,
+  then the launcher releases the app's storage, unmounts the boot volume and only then asks the panel for standby
+  (`bootmenu --standby`, the frame of the SP-16 or the DJS-1000). When it cannot unmount, the unit stays on and the menu
+  says why. When the unit stays on after the unmount, the official software starts again.
+
 ### Fixed
 - The X server's cursor no longer shows over the menu or the programs it starts.
 - When the menu's last screen fallback crashes instead of failing, the default entry still starts without a screen.

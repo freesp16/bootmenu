@@ -299,6 +299,7 @@ int main(int argc, char **argv) {
     t_start = bm_now();
     setvbuf(stderr, NULL, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "--exec")) return exec_mode(argc, argv);
+    if (argc == 2 && !strcmp(argv[1], "--standby")) return panel_standby();
     if (argc > 1 && !strcmp(argv[1], "--hide-cursor")) return x11_hide_cursor(argc > 2 ? atof(argv[2]) : 90);
     static Args a;
     if (parse(&a, argc, argv) != 0) {

@@ -42,6 +42,32 @@ int main(int argc, char **argv) {
 C
 printf 'int main(void) { return 3; }\n' > "$work/crashy.c"
 
+# `saver`: an app that has saved and asks for standby (receipt, exit status 76). With saver.mode=hold on the stick, a
+# child of it keeps the stick busy, so that it cannot be unmounted.
+cat > "$work/saver.c" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(void) {
+    const char *ready = getenv("BOOTMENU_STANDBY_READY"), *stick = getenv("BOOTMENU_STICK");
+    char mode[256], path[512];
+    snprintf(path, sizeof path, "%s/saver.mode", stick ? stick : "");
+    FILE *m = fopen(path, "r");
+    mode[0] = 0;
+    if (m) { if (!fgets(mode, sizeof mode, m)) mode[0] = 0; fclose(m); }
+    if (!strncmp(mode, "hold", 4) && fork() == 0) {
+        if (chdir(stick) == 0) sleep(40);
+        _exit(0);
+    }
+    printf("SAVER receipt=%s\n", ready ? ready : "(none)");
+    fflush(stdout);
+    FILE *f = ready && *ready ? fopen(ready, "w") : NULL;
+    if (f) fclose(f);
+    return 76;
+}
+C
+
 # The stand-in official application: where it runs and what /root/data holds for it.
 cat > "$work/fakefw.c" <<'C'
 #include <stdio.h>
@@ -194,6 +220,30 @@ check "the new log shows how the last session ended" "the end of the previous se
 check "...with its lines" "watcher: pid [0-9]* ended" $S/bootmenu.log
 echo "--- log (before the pull)"; cat /work/vol/before-pull.log
 echo "--- end of that session"; cat $E 2>/dev/null; sed -n '/the end of the previous session/,/^---$/p' $S/bootmenu.log
+
+echo "--- standby: the boot volume must be unmounted before the panel is asked"
+cp /work/apps/saver $S/saver
+wait_for "starting official" $S/bootmenu.log 15
+sleep 1
+echo "--- ...a child of the app still holds the stick: the unit stays on, and says why"
+echo hold > $S/saver.mode
+sh $CTL run saver
+wait_for "standby blocked" $S/bootmenu.log 25
+check "the app was given a receipt in RAM" "SAVER receipt=/tmp/bootmenu/power\\." $S/bootmenu.log
+check "a busy stick blocks the standby" "standby blocked: Could not unmount the Boot USB. Power is still on." $S/bootmenu.log
+grep -q " $S " /proc/mounts && echo "PASS the stick is still mounted" || { echo "FAIL the stick was unmounted"; fail=1; }
+kill $(pidof saver.bin) 2>/dev/null; sleep 1   # the holder is a child of the app
+wait_for "runner: menu exited" $S/bootmenu.log 15
+rm -f $S/saver.mode
+echo "--- ...nothing holds it: it is unmounted, and the panel (none here) is asked last"
+sh $CTL run saver
+wait_for "session over" /tmp/bootmenu/end.log 30
+check "the volume is released before the panel" "standby: boot volume released; requesting panel standby" /tmp/bootmenu/run.log
+check "a panel that does not cut the power brings the official software back" "panel standby returned while the unit was still on" /tmp/bootmenu/run.log
+grep -q " $S " /proc/mounts && { echo "FAIL the stick is still mounted"; fail=1; } || echo "PASS the stick was unmounted for real"
+sleep 2
+pidof EP085_Main_R >/dev/null && echo "PASS the official software runs again" || { echo "FAIL the official software is not running"; fail=1; }
+echo "--- log (standby)"; sed -n "/standby blocked/,\$p" /tmp/bootmenu/run.log 2>/dev/null; cat /tmp/bootmenu/end.log 2>/dev/null
 exit $fail
 TEST
 
@@ -204,6 +254,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$here":/src:ro -v "$work":/work "
   cc -std=gnu99 -O2 -DBM_DEV_HOST -o /work/iso/bootmenu /src/src/*.c -ldl -lm
   cc -O2 -o /work/apps/hello /work/hello.c
   cc -O2 -o /work/apps/crashy /work/crashy.c
+  cc -O2 -o /work/apps/saver /work/saver.c
   cc -O2 -Wl,--disable-new-dtags -Wl,-rpath,/usr/X11R6/lib/:/home/iMX6/ltib/rootfs/usr/lib/ -o /work/apps/fakefw /work/fakefw.c'
 # 2) encrypted with the throwaway key on the host
 python3 "$here/tools/encrypt-app.py" --key "$work/test.key" "$work/apps/hello" --out "$work/apps/secret.enc" >/dev/null

@@ -167,7 +167,8 @@ int panel_fd(void);                          /* -1 when closed */
 /* Reads every frame that is ready (non-blocking) and appends decoded events; returns the count added. */
 int panel_poll(InputEvent *out, int max);
 void panel_close(void);                      /* SP-16: timer off, close. DJS-1000: the exchange keeps running */
-void panel_request_standby(void);            /* DJS-1000: asks the panel to put the unit in standby (POWER) */
+void panel_request_standby(void);            /* asks the panel to put the unit in standby: the frame of the unit */
+int panel_standby(void);                     /* --standby: open the panel, request standby until the power goes (1: it did not) */
 
 /* ---- graphics (gfx.c) ----------------------------------------------------------------------------------------- */
 typedef enum { FONT_TITLE, FONT_NAME, FONT_BODY, FONT_HINT, FONT_CHIP, FONT_ICON, FONT_SPLASH, FONT_HERO } FontId;

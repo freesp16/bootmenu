@@ -10,7 +10,7 @@
  *   - LCD touch: raw big-endian X at 0x2c, Y at 0x2e, contact inside X 45..967 / Y 45..908, (0, 0) = released;
  *     screen = round((940 - rawX) * 720 / 868) + 40, round((rawY - 87) * 405 / 779) + 29;
  *   - open() turns the timer off, sets the link up, turns it on; close() turns it off again (confirmed on hardware).
- *     No TX (lamp) frame is ever sent.
+ *     The menu sends no TX frame on the SP-16, except the one that asks for standby (panel_standby()).
  *
  * DJS-1000, the layout seen on its panel link:
  *   - 16-bit counters little-endian as read: the rotary selector at 0x14, knob 1 at 0x08; touch X at 0x5e, Y at 0x60;
@@ -225,11 +225,50 @@ int panel_poll(InputEvent *out, int max) {
     return n;
 }
 
+/* SP-16: the frame that mutes the outputs and asks for standby (its bytes are not the DJS-1000's). */
+static void send_sp16_standby(void) {
+    memset(P.txf, 0, sizeof P.txf);
+    P.txf[0] = 0x02;
+    P.txf[102] = 1, P.txf[103] = 1, P.txf[110] = 4, P.txf[119] = 0xaa;
+    uint16_t c = crc_x25(P.txf, 124);
+    P.txf[124] = (uint8_t)c, P.txf[125] = (uint8_t)(c >> 8);
+    struct transfer t;
+    memset(&t, 0, sizeof t);
+    t.part_num = 1;
+    t.bytes = FRAME;
+    t.tx_buf = (uintptr_t)P.txf;
+    if (ioctl(P.fd, REQ_MESSAGE, &t) != 0) bm_log("panel: standby tx frame: %s", strerror(errno));
+}
+
 void panel_request_standby(void) {
-    if (P.fd < 0 || !P.l->lamps_off) return;
-    P.standby = 1;
-    send_frame();
+    if (P.fd < 0) return;
+    if (P.l->lamps_off) {
+        P.standby = 1;
+        send_frame();
+    } else {
+        send_sp16_standby();
+    }
     bm_log("panel: standby requested");
+}
+
+/* `bootmenu --standby`, run by the launcher once the boot volume is unmounted: the unit powers off within a moment. The
+ * SP-16's frame is sent again every 250 ms; the DJS-1000's is repeated by its driver (the exchange keeps running).
+ * Returns only when the power did not go within 20 s. */
+int panel_standby(void) {
+    char error[160];
+    if (panel_open(error, sizeof error)) {
+        bm_log("%s", error);
+        return 1;
+    }
+    panel_request_standby();
+    double deadline = bm_now() + 20.0;
+    do {
+        usleep(250000);
+        if (!P.l->lamps_off) send_sp16_standby();
+    } while (bm_now() < deadline);
+    bm_log("panel: standby did not cut power within 20 seconds");
+    panel_close();
+    return 1;
 }
 
 void panel_close(void) {

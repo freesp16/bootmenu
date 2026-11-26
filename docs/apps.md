@@ -146,3 +146,16 @@ type 1. The descriptor is little-endian:
 In C, one `const` struct with `__attribute__((section(".note.appinfo"), aligned(4), used))` is enough: the
 assembler marks it as a note, the linker gives it a `PT_NOTE` segment, and `strip` keeps it.
 `tools/test-arm.sh` has a small example. A `name=` in the `.ini` file wins over the note.
+
+### Standby handoff
+
+For an app with a data directory on the boot volume, the launcher sets
+`BOOTMENU_STANDBY_READY` to a fresh receipt path in RAM. An app requesting
+standby should write the receipt after completing its saves, close its
+devices and exit with status 76. The launcher requires both the receipt
+and the exit status. It releases the app's storage binds, closes the USB
+log, syncs, and unmounts the boot volume before signaling the panel.
+
+An empty receipt path means the launcher cannot offer this handoff. If
+the launcher cannot release storage, it leaves the unit powered on and
+reports the error in the menu.
