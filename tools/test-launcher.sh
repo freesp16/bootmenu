@@ -180,6 +180,10 @@ grep -q " /root/data \| /root/gui " /proc/mounts && { echo "FAIL a bind mount su
 [ "$(cat /root/data/Toraiz_SP16.dat)" = "unit settings" ] && [ "$(cat /root/gui/Resource/skin.txt)" = "unit skin" ] \
   && echo "PASS the unit's own /root/data and /root/gui are back" || { echo "FAIL the unit's files are not back"; fail=1; }
 check "the session ends" "runner: session over" $E
+# the session is released (runner.pid) only after its last lines: a stick put back before then finds it still active
+i=0; while [ -f /tmp/bootmenu/runner.pid ] && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+[ ! -f /tmp/bootmenu/runner.pid ] && echo "PASS the session is released after its last lines" \
+  || { echo "FAIL the session still holds runner.pid"; fail=1; }
 
 echo "--- the stick goes back in"
 mknod /dev/fakestick b 7 201 && mount -t tmpfs /dev/fakestick $S

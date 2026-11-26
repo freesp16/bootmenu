@@ -62,6 +62,15 @@ LOG="${USB:-/tmp}/bootmenu.log"
     echo "autoexec.sh: a runner is already active (pid $old); not starting another"; exit 0
   fi
 
+  # The previous session's log lines that were still in RAM when its stick was pulled (the runner copies them every 5 s).
+  off=$(cat "$STAGE/run.log.off" 2>/dev/null)
+  size=$(wc -c < "$STAGE/run.log" 2>/dev/null)
+  if [ "${size:-0}" -gt "${off:-0}" ]; then
+    echo "--- the previous session's last lines:"
+    tail -c +$((${off:-0} + 1)) "$STAGE/run.log"
+    echo "---"
+  fi
+  rm -f "$STAGE/run.log" "$STAGE/run.log.off"
   # How the previous session ended after its stick was pulled (that part of the log could only go to RAM).
   if [ -s "$STAGE/end.log" ]; then
     echo "--- the end of the previous session, after its stick was removed:"
@@ -77,7 +86,8 @@ LOG="${USB:-/tmp}/bootmenu.log"
   fi
   rm -rf "$STAGE/apps" 2>/dev/null
   mkdir -p "$STAGE/bin" "$STAGE/apps" "$STAGE/run" 2>/dev/null
-  rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" 2>/dev/null
+  rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" "$STAGE/flush.stop" \
+    2>/dev/null
 
   # 1) The small files first: the menu and the SSH server go to RAM before anything else. The old menu first goes
   # (unlinked), as the last session's may still be running (--hide-cursor) and a running file cannot be written.
@@ -118,12 +128,36 @@ LOG="${USB:-/tmp}/bootmenu.log"
 LOG_RUN="$1"
 USB_RUN="$2"
 STAGE=/tmp/bootmenu
-exec >>"$LOG_RUN" 2>&1
+# Nothing the session leaves running may hold the stick, or the official application's USB STOP waits for it (about
+# 10 s): the runner starts away from the image (mounted from the stick), and its log is kept in RAM.
+cd /
+RAM_LOG="$STAGE/run.log"
+exec >>"$RAM_LOG" 2>&1
 echo $$ > "$STAGE/runner.pid"
 echo "runner: detached, pid $$"
 
-# Flush the log to the stick every few seconds, so it survives pulling the stick or power-cycling.
-( while kill -0 $$ 2>/dev/null; do sleep 5; sync; done ) &
+# The new part of the RAM log appended to the stick's, while the stick is there. The file is open only for the copy.
+# The RAM log is never cut short: a shell cannot empty a file that other processes write to without losing what they
+# write meanwhile. It holds only the menu's and the runner's own lines (a few kB a session): apps write their output
+# to the stick themselves and the official software's goes nowhere (see launch_app).
+flush_log() {
+  [ -f "$STAGE/gone" ] && return 0
+  grep -q " $USB_RUN " /proc/mounts 2>/dev/null || return 0
+  off=$(cat "$STAGE/run.log.off" 2>/dev/null)
+  size=$(wc -c < "$RAM_LOG" 2>/dev/null) || return 0
+  [ "$size" -gt "${off:-0}" ] || return 0
+  tail -c +$((${off:-0} + 1)) "$RAM_LOG" | head -c $((size - ${off:-0})) >> "$LOG_RUN" || return 0
+  echo "$size" > "$STAGE/run.log.off"
+}
+
+# Copy the log to the stick every few seconds, so it survives pulling the stick or power-cycling. flush.stop ends it
+# (the runner's last copy is its own, below).
+( n=0
+  while kill -0 $$ 2>/dev/null && [ ! -f "$STAGE/flush.stop" ]; do
+    sleep 1; n=$((n + 1))
+    [ $((n % 5)) -eq 0 ] && [ ! -f "$STAGE/flush.stop" ] && { flush_log; sync; }
+  done ) &
+FLUSH_PID=$!
 
 # --- The unit and its official app ---------------------------------------------------------------------------------------
 # UNIT_KEY, UNIT_NAME, OFFICIAL_COMM, OFFICIAL_EXE, FAITHFUL_RESTART (bootmenu --unit-info, written by autoexec.sh)
@@ -201,7 +235,8 @@ official_state() {
   export BOOTMENU_EXEC_ENV BOOTMENU_EXEC_SIGNALS
 }
 
-# Detached (the subshell exits at once): init reaps the official app, and it outlives the runner.
+# Detached (the subshell exits at once): init reaps the official app, and it outlives the runner. Its output is not
+# logged: it would hold the stick open, and the application's own USB STOP would wait for it.
 restore_official() {
   if official_running; then return 0; fi
   if [ -x "$OFFICIAL_EXE" ]; then
@@ -210,15 +245,9 @@ restore_official() {
       announce_stick
       official_state
       echo "runner: as the unit started it${BOOTMENU_EXEC_ENV:+ ($BOOTMENU_EXEC_SIGNALS)}"
-      if [ -f "$STAGE/gone" ]; then
-        ( cd /root/pdj && "$STAGE/bin/bootmenu" --exec -- "$OFFICIAL_EXE" </dev/null >/dev/null 2>&1 & )
-      else
-        ( cd /root/pdj && "$STAGE/bin/bootmenu" --exec -- "$OFFICIAL_EXE" </dev/null & )
-      fi
-    elif [ -f "$STAGE/gone" ]; then
-      ( cd /root/pdj && "./$OFFICIAL_COMM" </dev/null >/dev/null 2>&1 & ) # the log was on the stick
+      ( cd /root/pdj && "$STAGE/bin/bootmenu" --exec -- "$OFFICIAL_EXE" </dev/null >/dev/null 2>&1 & )
     else
-      ( cd /root/pdj && "./$OFFICIAL_COMM" </dev/null & )
+      ( cd /root/pdj && "./$OFFICIAL_COMM" </dev/null >/dev/null 2>&1 & )
     fi
   fi
   sync
@@ -575,6 +604,9 @@ launch_app() {
       official_state
       export BOOTMENU_EXEC_KEEP="$keep" BOOTMENU_EXEC_PRELOAD="$PRELOAD"
       echo "runner: $BM_ID: the official application as the unit started it${BOOTMENU_EXEC_ENV:+ ($BOOTMENU_EXEC_SIGNALS)}${PRELOAD:+, with $PRELOAD}"
+      exec >/dev/null 2>&1 # as restore_official: its USB STOP must find the stick free
+    elif ( : >>"$LOG_RUN" ) 2>/dev/null; then
+      exec >>"$LOG_RUN" 2>&1 # an app's output straight to the stick's log
     fi
     if [ "$MOUNT_MODE" = ns ]; then
       # the bind mounts as SRC DST pairs, then --, then the command: made in the app's own mount namespace
@@ -781,9 +813,12 @@ stop_ssh
   if tr '\0' ' ' < "/proc/$CURSOR_PID/cmdline" 2>/dev/null | grep -q -- '--hide-cursor'; then
     kill -TERM "$CURSOR_PID" 2>/dev/null
   fi ) &
-rm -f "$STAGE/runner.pid" "$STAGE/state"
+touch "$STAGE/flush.stop"; wait "$FLUSH_PID" 2>/dev/null # one copy at a time: the periodic one ends first (1 s)
 echo "runner: session over"
+flush_log
 sync
+# The session is released last: a new insertion must not take the log and its offset while this one still writes them.
+rm -f "$STAGE/runner.pid" "$STAGE/state"
 RUNNER
   chmod 0755 "$STAGE/run.sh"
 
@@ -886,9 +921,9 @@ CTL
   # 4) Detach the runner (new session, so udev tearing down this process cannot take it along): the menu starts now.
   echo "autoexec.sh: detaching runner"
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$LOG" 2>&1 &
+    setsid "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$STAGE/run.log" 2>&1 &
   else
-    nohup "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$LOG" 2>&1 &
+    nohup "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$STAGE/run.log" 2>&1 &
   fi
 
   # 5) Copy the embedded apps out of the image while the menu is already up (the hook unmounts it when we return).

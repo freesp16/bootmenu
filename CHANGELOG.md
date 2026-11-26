@@ -21,6 +21,8 @@ All notable changes to this project are listed here. The format follows
 ### Fixed
 - The X server's cursor no longer shows over the menu or the programs it starts.
 - When the menu's last screen fallback crashes instead of failing, the default entry still starts without a screen.
+- Ejecting the stick from the official software no longer waits about 10 s: the session keeps nothing open on it.
+  The official software's own output is no longer written to `bootmenu.log`.
 
 ## [1.1.0] - 2026-11-24
 
