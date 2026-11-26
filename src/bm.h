@@ -1,4 +1,4 @@
-/* Boot menu for the SP-16 USB autoexec hook: shared declarations.
+/* Boot menu for the USB autoexec hook of the SP-16 and the DJS-1000: shared declarations.
  *
  * The program runs as root in place of the official application. It lists the executables it can launch (apps beside
  * autoexec.bin on the stick, plain or encrypted with the unit's key, apps embedded in autoexec.bin, the official
@@ -24,6 +24,33 @@
 double bm_now(void);             /* CLOCK_MONOTONIC seconds */
 double bm_ms_since_start(void);  /* ms since main() started */
 void bm_log(const char *fmt, ...) __attribute__((format(printf, 1, 2))); /* "BOOTMENU <t> ms ..." on stderr */
+
+/* ---- the unit (unit.c) ---------------------------------------------------------------------------------------
+ * The SP-16 and the DJS-1000 share the board, the screen, the GPU, the autoexec hook and its key. What differs is the
+ * official application (its name and releases) and the panel's frame layout. The unit is the one whose official
+ * application is installed, unless --unit or BOOTMENU_UNIT names it. */
+typedef enum { UNIT_SP16, UNIT_DJS1000 } UnitId;
+typedef struct {
+    long long bytes;      /* the official application's size in that release: one stat() tells it */
+    const char *version;
+} Release;
+typedef struct {
+    UnitId id;
+    const char *key;            /* "sp16", "djs1000": --unit, BOOTMENU_UNIT, --unit-info */
+    const char *name;           /* the model, as the header shows it */
+    const char *official_comm;  /* the official application's process name */
+    const char *official_exe;   /* its installed path */
+    const char *official_name;  /* its row in the menu */
+    const Release *releases;
+    int n_releases;
+    /* 1: the official application is started again in the environment and with the signal settings it had when the
+     * unit started it, and the stick is announced to it again (it would not see the stick otherwise) */
+    int faithful_restart;
+} Unit;
+const Unit *unit(void);                      /* the detected (or chosen) unit; detected once */
+int unit_choose(const char *key);            /* --unit: 0 when known */
+/* The release of an official application of this size, on any unit; *u gets the unit it is for. NULL if unknown. */
+const char *unit_release(long long bytes, const Unit **u);
 
 /* ---- configuration: bootmenu.conf on the stick ---------------------------------------------------------------- */
 typedef struct {
@@ -63,8 +90,18 @@ typedef struct {
     int icon_w, icon_h;    /* app-info icon (RGBA8), 0 = none: draw the letter tile */
     long icon_off;         /* file offset of the icon pixels */
     int encrypted;         /* 1 = the file is encrypted with the unit's key (crypt.c): the launcher decrypts it to RAM */
-    int official_build;    /* 1 = the official SP-16 application (EP085_Main_R) under any file name: runs in /root/pdj */
+    int official_build;    /* 1 = an official application (of either unit) under any file name: runs in /root/pdj */
+    char model[24];        /* official_build: the unit it was made for, by its release ("" = unknown) */
     char gui[320];         /* its own screen resources, laid over /root/gui while it runs ("" = none): <id>-gui/ */
+    /* exe=official: the unit's installed official application, started as the unit starts it (see Unit), with: */
+    int as_official;
+    char preload[320];     /* preload= a library loaded into it first (LD_PRELOAD), copied to RAM by the launcher */
+    char official_md5[40]; /* official_md5= it starts only on the official application with this MD5 */
+    char needs[24];        /* needs_official= the release it needs, checked by size when the stick is scanned */
+#define BM_MAX_ENV 8
+    char env[BM_MAX_ENV][160]; /* env=KEY=value lines: ${STICK} and ${APP_DIR} are the stick's and the app's folders */
+    int n_env;
+    char unavailable[128]; /* why it cannot start on this unit ("" = it can): shown on its row, launching refused */
 } App;
 
 typedef struct {
@@ -102,7 +139,7 @@ ssize_t crypt_pread(int fd, void *dst, size_t len, off_t off);
 int crypt_decrypt_file(const char *path, int out_fd); /* the whole program, decrypted, to out_fd; 0 on success */
 
 /* ---- official app (official.c) -------------------------------------------------------------------------------------- */
-int official_signal(int sig);                  /* signals every live EP085_Main_R; returns how many */
+int official_signal(int sig);                  /* signals every live official application (unit()); returns how many */
 int official_running(void);
 int official_wait_gone(int timeout_ms);        /* 1 when gone within the timeout */
 
@@ -119,7 +156,7 @@ int backlight_level(int step);               /* 1..5 -> the driver's level, as t
 int backlight_wake(const char *settings, char *info, size_t infolen);
 
 /* ---- panel link (panel.c) ------------------------------------------------------------------------------------- */
-typedef enum { IN_NONE, IN_TURN, IN_PUSH, IN_BACK, IN_HOME, IN_TOUCH_DOWN, IN_TOUCH_UP } InputKind;
+typedef enum { IN_NONE, IN_TURN, IN_PUSH, IN_BACK, IN_HOME, IN_TOUCH_DOWN, IN_TOUCH_UP, IN_POWER } InputKind;
 typedef struct {
     InputKind kind;
     int value;  /* IN_TURN: detents (+ = clockwise) */
@@ -129,13 +166,14 @@ int panel_open(char *info, size_t infolen);  /* 0 = running */
 int panel_fd(void);                          /* -1 when closed */
 /* Reads every frame that is ready (non-blocking) and appends decoded events; returns the count added. */
 int panel_poll(InputEvent *out, int max);
-void panel_close(void);                      /* timer off, close: the device is idle for the next owner */
+void panel_close(void);                      /* SP-16: timer off, close. DJS-1000: the exchange keeps running */
+void panel_request_standby(void);            /* DJS-1000: asks the panel to put the unit in standby (POWER) */
 
 /* ---- graphics (gfx.c) ----------------------------------------------------------------------------------------- */
 typedef enum { FONT_TITLE, FONT_NAME, FONT_BODY, FONT_HINT, FONT_CHIP, FONT_ICON, FONT_SPLASH, FONT_HERO } FontId;
 
-/* "fb" (Vivante, straight to /dev/fb0), "x11" (Vivante into an X window), "host" (Mesa libEGL/libGLESv2 + X11,
- * development only). gfx_load only loads the libraries (safe while the official app still runs); gfx_open makes the
+/* "fb" (Vivante, straight to /dev/fb0), "x11" (Vivante into an X window), "cpu" (drawn by the CPU into an X window:
+ * soft.c, no GPU needed), "host" (Mesa libEGL/libGLESv2 + X11, development only). gfx_load only loads the libraries (safe while the official app still runs); gfx_open makes the
  * window, context, shaders and the atlas texture. */
 int gfx_load(const char *backend, char *err, size_t errlen);
 int gfx_open(char *err, size_t errlen);
@@ -165,10 +203,14 @@ void gfx_close(void);         /* fb backend: leaves the shown frame on buffer 0 
 
 /* ---- X11 window (x11.c): gl-x11 on the unit, the host development window ------------------------------------- */
 int x11_open(int w, int h, int fullscreen, char *err, size_t errlen);
+int x11_hide_cursor(double wait_s); /* --hide-cursor: until SIGTERM (0), 1 if it could not start */
 void *x11_display(void);
 unsigned long x11_window(void);
 int x11_fd(void);
 int x11_poll(InputEvent *out, int max, int *quit); /* keyboard: arrows = turn, Return = push, Escape = back */
+/* The CPU renderer's frames (soft.c): an image in the server's format, put on the window. */
+int x11_present_prepare(int w, int h, char *how, size_t howlen);
+int x11_present(const uint32_t *px, int w, int h);
 
 /* ---- menu (ui.c) ---------------------------------------------------------------------------------------------- */
 typedef struct Menu Menu;

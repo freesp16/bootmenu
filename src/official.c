@@ -1,5 +1,5 @@
-/* The official application (EP085_Main_R) owns the LCD, the panel link and audio: the menu asks it to quit first thing
- * (SIGTERM), does its own start-up while it shuts down, and only waits for it right before it needs the screen.
+/* The official application (EP085_Main_R on the SP-16, EP113_Main_R on the DJS-1000: unit.c) owns the LCD, the panel
+ * link and audio: the menu asks it to quit first thing (SIGTERM), does its own start-up while it shuts down, and only waits for it right before it needs the screen.
  * Polling /proc every 10 ms instead of the shell's 1-second sleeps is most of the start-up time saved. */
 #include "bm.h"
 
@@ -12,7 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define OFFICIAL_COMM "EP085_Main_R"
+
 
 /* Sends sig (0 = none) to every live (not zombie) process whose comm is the official app's; returns how many. */
 static int each_official(int sig) {
@@ -34,7 +34,7 @@ static int each_official(int sig) {
         char *open_p = strchr(buf, '('), *close_p = strrchr(buf, ')');
         if (!open_p || !close_p || close_p < open_p) continue;
         *close_p = 0;
-        if (strcmp(open_p + 1, OFFICIAL_COMM) != 0) continue;
+        if (strcmp(open_p + 1, unit()->official_comm) != 0) continue;
         if (close_p[1] == ' ' && close_p[2] == 'Z') continue;
         n++;
         if (sig) kill((pid_t)atoi(e->d_name), sig);

@@ -1,10 +1,15 @@
 #!/bin/sh
 #
-# launcher.sh - Boot menu, run by autoexec.sh (the stub the SP-16's own USB autoexec hook starts AS ROOT). Shows the boot menu (bootmenu, an
+# launcher.sh - Boot menu, run by autoexec.sh (the stub the unit's own USB autoexec hook starts AS ROOT). Shows the boot menu (bootmenu, an
 # OpenGL ES program) in place of the official app, then runs what was chosen: an app beside autoexec.bin on the stick, an
 # app embedded in this image, or the official software. When an app quits, the menu comes back. Optional SSH server on the
 # LINK port (development images only). Nothing is written to internal flash: everything runs from RAM (/tmp/bootmenu) and
 # the apps keep their data on the stick.
+#
+# The same image runs on the SP-16 and the DJS-1000 (`bootmenu --unit-info` tells which). On the DJS-1000 the official
+# application is started again as the unit started it: in the environment and with the signal settings it had (read
+# from /proc before the menu stops it), and with the stick announced to it again. An entry with exe=official runs the
+# installed official application that way too, with a library of its own preloaded (a mod of the official software).
 #
 # Call chain on the device (official firmware, nothing modified):
 #   udev mounts the FAT stick -> /root/pdj/decrypt_autoexec.sh <stick>
@@ -57,6 +62,15 @@ LOG="${USB:-/tmp}/bootmenu.log"
     echo "autoexec.sh: a runner is already active (pid $old); not starting another"; exit 0
   fi
 
+  # The previous session's log lines that were still in RAM when its stick was pulled (the runner copies them every 5 s).
+  off=$(cat "$STAGE/run.log.off" 2>/dev/null)
+  size=$(wc -c < "$STAGE/run.log" 2>/dev/null)
+  if [ "${size:-0}" -gt "${off:-0}" ]; then
+    echo "--- the previous session's last lines:"
+    tail -c +$((${off:-0} + 1)) "$STAGE/run.log"
+    echo "---"
+  fi
+  rm -f "$STAGE/run.log" "$STAGE/run.log.off"
   # How the previous session ended after its stick was pulled (that part of the log could only go to RAM).
   if [ -s "$STAGE/end.log" ]; then
     echo "--- the end of the previous session, after its stick was removed:"
@@ -72,13 +86,23 @@ LOG="${USB:-/tmp}/bootmenu.log"
   fi
   rm -rf "$STAGE/apps" 2>/dev/null
   mkdir -p "$STAGE/bin" "$STAGE/apps" "$STAGE/run" 2>/dev/null
-  rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" 2>/dev/null
+  rm -f "$STAGE/gone" "$STAGE/request" "$STAGE/child.pid" "$STAGE/runner.done" "$STAGE/choice.sh" "$STAGE/flush.stop" \
+    2>/dev/null
 
-  # 1) The small files first: the menu and the SSH server go to RAM before anything else.
+  # 1) The small files first: the menu and the SSH server go to RAM before anything else. The old menu first goes
+  # (unlinked), as the last session's may still be running (--hide-cursor) and a running file cannot be written.
+  rm -f "$STAGE/bin/bootmenu" 2>/dev/null
   if ! cp "$SELF_DIR/bootmenu" "$STAGE/bin/bootmenu" 2>/dev/null; then
     echo "ERROR: could not copy the menu out of the image (no room in /tmp?)"; exit 1
   fi
   chmod 0755 "$STAGE/bin/bootmenu"
+
+  # The unit (SP-16 or DJS-1000: the official application that is installed), for the runner and ctl.
+  "$STAGE/bin/bootmenu" --unit-info > "$STAGE/unit.sh" 2>/dev/null || rm -f "$STAGE/unit.sh"
+  OFFICIAL_COMM=EP085_Main_R; FAITHFUL_RESTART=0
+  [ -f "$STAGE/unit.sh" ] && . "$STAGE/unit.sh"
+  echo "autoexec.sh: unit ${UNIT_NAME:-unknown}, official application $OFFICIAL_COMM"
+
   if [ -f "$SELF_DIR/dropbearmulti" ] && cp "$SELF_DIR/dropbearmulti" "$STAGE/bin/dropbearmulti" 2>/dev/null; then
     chmod 0755 "$STAGE/bin/dropbearmulti"
   else
@@ -104,31 +128,126 @@ LOG="${USB:-/tmp}/bootmenu.log"
 LOG_RUN="$1"
 USB_RUN="$2"
 STAGE=/tmp/bootmenu
-exec >>"$LOG_RUN" 2>&1
+# Nothing the session leaves running may hold the stick, or the official application's USB STOP waits for it (about
+# 10 s): the runner starts away from the image (mounted from the stick), and its log is kept in RAM.
+cd /
+RAM_LOG="$STAGE/run.log"
+exec >>"$RAM_LOG" 2>&1
 echo $$ > "$STAGE/runner.pid"
 echo "runner: detached, pid $$"
 
-# Flush the log to the stick every few seconds, so it survives pulling the stick or power-cycling.
-( while kill -0 $$ 2>/dev/null; do sleep 5; sync; done ) &
+# The new part of the RAM log appended to the stick's, while the stick is there. The file is open only for the copy.
+# The RAM log is never cut short: a shell cannot empty a file that other processes write to without losing what they
+# write meanwhile. It holds only the menu's and the runner's own lines (a few kB a session): apps write their output
+# to the stick themselves and the official software's goes nowhere (see launch_app).
+flush_log() {
+  [ -f "$STAGE/gone" ] && return 0
+  grep -q " $USB_RUN " /proc/mounts 2>/dev/null || return 0
+  off=$(cat "$STAGE/run.log.off" 2>/dev/null)
+  size=$(wc -c < "$RAM_LOG" 2>/dev/null) || return 0
+  [ "$size" -gt "${off:-0}" ] || return 0
+  tail -c +$((${off:-0} + 1)) "$RAM_LOG" | head -c $((size - ${off:-0})) >> "$LOG_RUN" || return 0
+  echo "$size" > "$STAGE/run.log.off"
+}
 
-# --- Official app --------------------------------------------------------------------------------------------------------
+# Copy the log to the stick every few seconds, so it survives pulling the stick or power-cycling. flush.stop ends it
+# (the runner's last copy is its own, below).
+( n=0
+  while kill -0 $$ 2>/dev/null && [ ! -f "$STAGE/flush.stop" ]; do
+    sleep 1; n=$((n + 1))
+    [ $((n % 5)) -eq 0 ] && [ ! -f "$STAGE/flush.stop" ] && { flush_log; sync; }
+  done ) &
+FLUSH_PID=$!
+
+# --- The unit and its official app ---------------------------------------------------------------------------------------
+# UNIT_KEY, UNIT_NAME, OFFICIAL_COMM, OFFICIAL_EXE, FAITHFUL_RESTART (bootmenu --unit-info, written by autoexec.sh)
+OFFICIAL_COMM=EP085_Main_R; OFFICIAL_EXE=/root/pdj/EP085_Main_R; FAITHFUL_RESTART=0
+[ -f "$STAGE/unit.sh" ] && . "$STAGE/unit.sh"
+echo "runner: unit ${UNIT_NAME:-unknown} (official application $OFFICIAL_EXE)"
+
 official_pids() {
-  for p in $(pidof EP085_Main_R 2>/dev/null); do
+  for p in $(pidof "$OFFICIAL_COMM" 2>/dev/null); do
     s=$(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null)
     [ -n "$s" ] && [ "$s" != Z ] && echo "$p"
   done
 }
 official_running() { [ -n "$(official_pids)" ]; }
 
-# Detached (the subshell exits at once): init reaps the official app, and it outlives the runner.
+# DJS-1000: the official application learns of the stick from two queues udev writes to at the insertion. One that
+# starts later never hears of it, so they are emptied (a message beginning with 0) and written again for it alone.
+announce_stick() {
+  [ "$FAITHFUL_RESTART" = 1 ] || return 0
+  { echo -n 0 > /proc/udev_usbctn1 && echo -n 0 > /proc/udev_usb1; } 2>/dev/null || return 0
+  if [ ! -f "$STAGE/gone" ] && grep -q " $USB_RUN " /proc/mounts 2>/dev/null; then
+    echo -n connect > /proc/udev_usbctn1; echo -n "mount $USB_RUN" > /proc/udev_usb1
+    echo "runner: the stick announced again for the official application"
+  fi
+}
+
+# A stick that is in at power-on is mounted, and this image run, before the unit's start-up gets to the official
+# application. The menu would then find nothing to stop, and the application would start over it. So when it does
+# not run yet and the unit is still starting (apl_start runs, or it is up for less than 5 minutes),, the menu waits for it (90 s at most), then stops it as usual.
+wait_for_official() {
+  [ "$FAITHFUL_RESTART" = 1 ] || return 0 # seen on the DJS-1000, the SP-16 is left as it was
+  official_running && return 0
+  up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  starting=""
+  [ "${up:-0}" -lt 300 ] && starting=1
+  grep -q apl_start /proc/[0-9]*/cmdline 2>/dev/null && starting=1
+  [ -d /opt/djsemu ] && starting=1
+  [ -n "$starting" ] && [ -x "$OFFICIAL_EXE" ] || return 0
+  echo "runner: the official application is not running yet (the unit is starting): waiting for it"
+  i=0
+  while [ $i -lt 90 ] && ! official_running; do sleep 1; i=$((i+1)); [ -f "$STAGE/gone" ] && return 0; done
+  if official_running; then
+    echo "runner: it started after $i s"
+    sleep 2 # let it get to its signal handlers before it is asked to stop
+  else
+    echo "runner: it did not start within 90 s"
+  fi
+}
+
+# DJS-1000: how the unit started its official application (its environment, its blocked and ignored signals), so
+# that it can be started again the same way: one started from this hook would otherwise inherit udev's, and behave
+# differently. Read once a boot, from the unit's own start, before the menu stops it. When it cannot be read, the
+# runner's state is used.
+capture_official() {
+  [ "$FAITHFUL_RESTART" = 1 ] && [ ! -s "$STAGE/official.env" ] || return 0
+  for p in $(official_pids); do
+    case $(readlink "/proc/$p/exe" 2>/dev/null) in */"$OFFICIAL_COMM") ;; *) continue;; esac
+    tr '\0' '\n' < "/proc/$p/environ" | grep -v -E '^(LD_PRELOAD|BOOTMENU_[A-Z_]*|DJS1000_MODS_[A-Z_]*)=' \
+      > "$STAGE/official.env.tmp" && mv "$STAGE/official.env.tmp" "$STAGE/official.env"
+    grep -E '^Sig(Blk|Ign):' "/proc/$p/status" | tr -d '\t' | tr '\n' ' ' > "$STAGE/official.sig"
+    echo "runner: the official application as the unit started it (pid $p): $(cat "$STAGE/official.sig")"
+    return 0
+  done
+  echo "runner: the official application's start state is not readable here: the runner's is used"
+}
+
+# DJS-1000: the environment and signal settings the official application had when the unit started it
+# (capture_official), for `bootmenu --exec`. Without them, the runner's own are used.
+official_state() {
+  if [ "$FAITHFUL_RESTART" = 1 ] && [ -s "$STAGE/official.env" ]; then
+    BOOTMENU_EXEC_ENV="$STAGE/official.env"; BOOTMENU_EXEC_SIGNALS=$(cat "$STAGE/official.sig" 2>/dev/null)
+  else
+    BOOTMENU_EXEC_ENV=""; BOOTMENU_EXEC_SIGNALS=""
+  fi
+  export BOOTMENU_EXEC_ENV BOOTMENU_EXEC_SIGNALS
+}
+
+# Detached (the subshell exits at once): init reaps the official app, and it outlives the runner. Its output is not
+# logged: it would hold the stick open, and the application's own USB STOP would wait for it.
 restore_official() {
   if official_running; then return 0; fi
-  if [ -x /root/pdj/EP085_Main_R ]; then
-    echo "runner: starting official EP085_Main_R"
-    if [ -f "$STAGE/gone" ]; then
-      ( cd /root/pdj && ./EP085_Main_R </dev/null >/dev/null 2>&1 & ) # the log was on the stick
+  if [ -x "$OFFICIAL_EXE" ]; then
+    echo "runner: starting official $OFFICIAL_COMM"
+    if [ "$FAITHFUL_RESTART" = 1 ]; then
+      announce_stick
+      official_state
+      echo "runner: as the unit started it${BOOTMENU_EXEC_ENV:+ ($BOOTMENU_EXEC_SIGNALS)}"
+      ( cd /root/pdj && "$STAGE/bin/bootmenu" --exec -- "$OFFICIAL_EXE" </dev/null >/dev/null 2>&1 & )
     else
-      ( cd /root/pdj && ./EP085_Main_R </dev/null & )
+      ( cd /root/pdj && "./$OFFICIAL_COMM" </dev/null >/dev/null 2>&1 & )
     fi
   fi
   sync
@@ -137,14 +256,14 @@ restore_official() {
 # The menu stops the official app itself (fast); this is for `ctl run` and for apps started without the menu.
 stop_official() {
   official_running || return 0
-  echo "runner: stopping official EP085_Main_R"
-  killall -TERM EP085_Main_R 2>/dev/null || kill -TERM $(official_pids) 2>/dev/null
+  echo "runner: stopping official $OFFICIAL_COMM"
+  killall -TERM "$OFFICIAL_COMM" 2>/dev/null || kill -TERM $(official_pids) 2>/dev/null
   i=0
   while [ $i -lt 10 ]; do
     official_running || break
     sleep 1; i=$((i+1))
   done
-  killall -KILL EP085_Main_R 2>/dev/null || kill -KILL $(official_pids) 2>/dev/null
+  killall -KILL "$OFFICIAL_COMM" 2>/dev/null || kill -KILL $(official_pids) 2>/dev/null
   sleep 1
   # its screen saver may have dimmed the LCD; only the official app would brighten it again
   "$STAGE/bin/bootmenu" --wake-backlight || true
@@ -410,9 +529,32 @@ seed_official_data() {
 
 # Starts the chosen app (choice.sh is sourced) in the background; APP_PID = its pid.
 launch_app() {
+  LAUNCH_ERR=""
   app_binary || { echo "runner: ERROR $BM_ID could not be decrypted (no key on this unit, or no room)"; return 1; }
   prepare_gui
+  # exe=official: the installed official application, as the unit starts it, with the entry's library preloaded
+  RUN_PFX=""; RUN_DIR="$BM_DIR"; PRELOAD=""
+  if [ "$BM_AS_OFFICIAL" = 1 ]; then
+    RUN_DIR=/root/pdj
+    if [ -n "$BM_OFFICIAL_MD5" ]; then
+      sum=$(md5sum "$APP_EXE" 2>/dev/null | cut -c1-32)
+      if [ "$sum" != "$BM_OFFICIAL_MD5" ]; then
+        echo "runner: $BM_ID: the official application is ${sum:-unreadable}, not the $BM_OFFICIAL_MD5 it needs"
+        LAUNCH_ERR="$BM_NAME needs another build of the official software"; return 1
+      fi
+      echo "runner: $BM_ID: the official application is the build it needs"
+    fi
+    if [ -n "$BM_PRELOAD" ]; then
+      # in RAM, so the application keeps its library whatever happens to the stick
+      run_ramdisk
+      PRELOAD="$STAGE/run/preload/$BM_ID/$(basename "$BM_PRELOAD")"
+      mkdir -p "$(dirname "$PRELOAD")" && cp "$BM_PRELOAD" "$PRELOAD.new" 2>/dev/null && mv -f "$PRELOAD.new" "$PRELOAD" \
+        || { echo "runner: ERROR $BM_ID: could not copy $BM_PRELOAD to RAM"; LAUNCH_ERR="$BM_NAME: its library could not be copied"; return 1; }
+    fi
+    RUN_PFX="$STAGE/bin/bootmenu --exec --"
+  fi
   stop_official
+  [ "$BM_AS_OFFICIAL" = 1 ] && announce_stick
   log_holders "before launching $BM_ID"
   DATA=""
   if [ "$BM_DATA" != none ] && [ -n "$BM_DATA" ]; then
@@ -438,11 +580,34 @@ launch_app() {
       echo "runner: WARNING could not mount its screen resources; $BM_ID uses the unit's"
     fi
   fi
-  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $BM_DIR, /root/data = ${DATA:-unchanged}${APP_GUI:+, /root/gui = $APP_GUI}, $MOUNT_MODE)"
+  echo "runner: launching $BM_ID: $APP_EXE${BM_ARGS:+ $BM_ARGS} (cwd $RUN_DIR, /root/data = ${DATA:-unchanged}${APP_GUI:+, /root/gui = $APP_GUI}, $MOUNT_MODE)"
   (
-    cd "$BM_DIR" 2>/dev/null || cd /tmp
+    cd "$RUN_DIR" 2>/dev/null || cd /tmp
     [ -n "$BM_CONF" ] && read_conf "$USB_RUN/$BM_CONF" "$BM_PREFIX" && echo "runner: $BM_CONF -> ${BM_PREFIX}*"
-    export HOME="${DATA:-$STAGE}" BOOTMENU_STICK="$USB_RUN" BOOTMENU_APP_DIR="$BM_DIR" BOOTMENU_APP_ID="$BM_ID"
+    export BOOTMENU_STICK="$USB_RUN" BOOTMENU_APP_DIR="$BM_DIR" BOOTMENU_APP_ID="$BM_ID" BOOTMENU_UNIT="$UNIT_KEY"
+    # the official application keeps the home the unit gave it
+    [ "$BM_AS_OFFICIAL" = 1 ] || export HOME="${DATA:-$STAGE}"
+    # env=KEY=value lines of the entry, ${STICK} and ${APP_DIR} in their values replaced
+    keep="BOOTMENU_*"
+    [ -n "$BM_CONF" ] && keep="$keep ${BM_PREFIX}*"
+    i=1
+    while [ "$i" -le "${BM_ENV_COUNT:-0}" ]; do
+      eval "line=\$BM_ENV_$i"
+      key=${line%%=*}; val=${line#*=}
+      case "$key" in ''|[0-9]*|*[!A-Za-z0-9_]*) echo "runner: env line $i ignored (bad name)"; i=$((i+1)); continue;; esac
+      val=$(printf '%s' "$val" | sed "s#\${STICK}#$USB_RUN#g; s#\${APP_DIR}#$BM_DIR#g")
+      export "$key=$val"; keep="$keep $key"
+      echo "runner: env $key=$val"
+      i=$((i+1))
+    done
+    if [ "$BM_AS_OFFICIAL" = 1 ]; then
+      official_state
+      export BOOTMENU_EXEC_KEEP="$keep" BOOTMENU_EXEC_PRELOAD="$PRELOAD"
+      echo "runner: $BM_ID: the official application as the unit started it${BOOTMENU_EXEC_ENV:+ ($BOOTMENU_EXEC_SIGNALS)}${PRELOAD:+, with $PRELOAD}"
+      exec >/dev/null 2>&1 # as restore_official: its USB STOP must find the stick free
+    elif ( : >>"$LOG_RUN" ) 2>/dev/null; then
+      exec >>"$LOG_RUN" 2>&1 # an app's output straight to the stick's log
+    fi
     if [ "$MOUNT_MODE" = ns ]; then
       # the bind mounts as SRC DST pairs, then --, then the command: made in the app's own mount namespace
       set --
@@ -451,37 +616,55 @@ launch_app() {
       if [ $# -gt 0 ]; then
         # shellcheck disable=SC2086
         exec unshare -m sh -c 'while [ "$1" != -- ]; do mount -o bind "$1" "$2" || exit 97; shift 2; done; shift
-          exec "$@"' sh "$@" -- "$APP_EXE" $BM_ARGS
+          exec "$@"' sh "$@" -- $RUN_PFX "$APP_EXE" $BM_ARGS
       fi
     fi
     # shellcheck disable=SC2086
-    exec "$APP_EXE" $BM_ARGS
+    exec $RUN_PFX "$APP_EXE" $BM_ARGS
   ) </dev/null &
   APP_PID=$!
   return 0
 }
 
-# Runs the menu; on success choice.sh holds the choice. fb first; if that fails or crashes, x11, which falls back to
-# the default entry (or the official software) by itself when it cannot draw either.
+# Runs the menu; on success choice.sh holds the choice. The renderers in turn, each tried when the one before failed
+# or crashed: gl-fb (the GPU straight to the framebuffer), gl-x11 (the GPU into an X window; not on the DJS-1000, where
+# its window stays black), cpu (drawn by the CPU into an X window: no GPU needed). The last one
+# tried falls back to the default entry (or the official software) by itself when it cannot draw either.
+menu_try() { # RENDER [--fallback]: sets rc
+  "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" --render "$@" \
+    ${MSG:+--message "$MSG"} </dev/null &
+  echo $! > "$STAGE/child.pid"; wait $!; rc=$?
+  rm -f "$STAGE/child.pid"
+  [ $rc -eq 6 ] && echo "runner: menu: the stick was pulled" && touch "$STAGE/gone"
+  return 0
+}
+menu_failed() { # the renderer could not draw (2) or crashed, and nothing else happened
+  [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] && { [ $rc -eq 2 ] || [ $rc -ge 128 ]; }
+}
 run_menu() {
   rm -f "$STAGE/choice.sh"
   echo "runner: menu${MSG:+ (message: $MSG)}"
   FALLBACK=""
-  "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" \
-    ${MSG:+--message "$MSG"} </dev/null &
-  echo $! > "$STAGE/child.pid"; wait $!; rc=$?
-  rm -f "$STAGE/child.pid"
-  if [ $rc -eq 6 ]; then
-    echo "runner: menu: the stick was pulled"; touch "$STAGE/gone"
-  fi
-  if [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] \
-     && { [ $rc -eq 2 ] || [ $rc -ge 128 ]; }; then
+  menu_try fb
+  last=fb
+  if menu_failed && [ "$UNIT_KEY" != djs1000 ]; then
     echo "runner: menu: gl-fb failed (rc=$rc); trying gl-x11"
-    "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" --render x11 \
-      --fallback ${MSG:+--message "$MSG"} </dev/null &
-    echo $! > "$STAGE/child.pid"; wait $!; rc=$?
-    rm -f "$STAGE/child.pid"
+    menu_try x11
+    last=x11
+  fi
+  if menu_failed; then
+    echo "runner: menu: gl-$last failed (rc=$rc); trying cpu"
+    menu_try cpu --fallback
     [ $rc -eq 3 ] && FALLBACK=1 && echo "runner: menu: no screen; the default entry was chosen without it"
+    # the cpu renderer crashed instead of failing: choose as --fallback would have (after a failed start, the
+    # official software)
+    if [ ! -f "$STAGE/choice.sh" ] && [ ! -f "$STAGE/request" ] && [ ! -f "$STAGE/gone" ] && [ $rc -ge 128 ]; then
+      spec=default; [ -n "$MSG" ] && spec=official
+      if "$STAGE/bin/bootmenu" --stick "$USB_RUN" --embedded "$STAGE/apps" --out "$STAGE/choice.sh" \
+           --resolve "$spec" </dev/null; then
+        FALLBACK=1; echo "runner: menu: cpu crashed (rc=$rc); no screen, the $spec entry was chosen without it"
+      fi
+    fi
   fi
   MSG=""
   echo "runner: menu exited rc=$rc"
@@ -491,13 +674,19 @@ run_menu() {
 load_choice() {
   BM_KIND=""; BM_ID=""; BM_NAME=""; BM_SOURCE=""; BM_EXE=""; BM_DIR=""; BM_ARGS=""; BM_DATA=""; BM_CONF=""
   BM_PREFIX=""; BM_RUN_FROM=""; BM_SIZE=""; BM_MTIME=""; BM_ENCRYPTED=""; BM_OFFICIAL_BUILD=""; BM_GUI=""
+  BM_UNIT=""; BM_AS_OFFICIAL=""; BM_PRELOAD=""; BM_OFFICIAL_MD5=""; BM_ENV_COUNT=0
   . "$STAGE/choice.sh"
 }
 
 # --- Bring-up ----------------------------------------------------------------------------------------------------------
-DISPLAY=${DISPLAY:-:0}   # the boot scripts never export it; the X server (Xfbdev) is :0 (used by gl-x11 only)
+DISPLAY=${DISPLAY:-:0}   # the boot scripts never export it; the X server (Xfbdev) is :0 (gl-x11 and cpu)
 export DISPLAY
 cd "$STAGE" 2>/dev/null || cd /tmp
+
+# The X server's cursor hidden for the whole session (see x11_hide_cursor in src/x11.c). Started while the official app
+# is still connected, so the server never starts over and shows its cursor between the menu and an app.
+"$STAGE/bin/bootmenu" --hide-cursor </dev/null &
+CURSOR_PID=$!
 
 # Network and SSH beside the menu, never in front of it.
 ( setup_network; start_ssh ) &
@@ -546,6 +735,8 @@ WATCHER_PID=$!
 # --- Supervisor --------------------------------------------------------------------------------------------------------
 # NEXT: menu (show it), run (resolve RUN_SPEC without the menu), app (run choice.sh), official, idle (wait for ctl).
 # ctl writes $STAGE/request ("menu", "run SPEC", "official", "stop") and stops the current child.
+wait_for_official
+capture_official
 NEXT=menu; MSG=""; RUN_SPEC=""; FALLBACK=""
 while :; do
   [ -f "$STAGE/gone" ] && break
@@ -583,7 +774,7 @@ while :; do
     app)
       echo "app $BM_ID" > "$STAGE/state"
       t0=$(cut -d. -f1 /proc/uptime)
-      if ! launch_app; then MSG="$BM_NAME could not start (see bootmenu.log)"; NEXT=menu; continue; fi
+      if ! launch_app; then MSG=${LAUNCH_ERR:-"$BM_NAME could not start (see bootmenu.log)"}; NEXT=menu; continue; fi
       echo "$APP_PID" > "$STAGE/child.pid"
       echo "runner: $BM_ID pid $APP_PID"
       ( sleep 5; log_holders "5 s after launching $BM_ID" ) &
@@ -616,19 +807,29 @@ after_app
 if [ -f "$STAGE/gone" ]; then restore_once; else restore_official; fi   # first: the unit is usable again at once
 [ -f "$STAGE/gone" ] && wait "$WATCHER_PID" 2>/dev/null   # its recovery steps end up in the log before this one
 stop_ssh
-rm -f "$STAGE/runner.pid" "$STAGE/state"
+# The cursor stays hidden until the official software has connected to the X server, then the helper gives the server
+# its own cursor back. Signalled only while the PID is still the helper's.
+( sleep 30
+  if tr '\0' ' ' < "/proc/$CURSOR_PID/cmdline" 2>/dev/null | grep -q -- '--hide-cursor'; then
+    kill -TERM "$CURSOR_PID" 2>/dev/null
+  fi ) &
+touch "$STAGE/flush.stop"; wait "$FLUSH_PID" 2>/dev/null # one copy at a time: the periodic one ends first (1 s)
 echo "runner: session over"
+flush_log
 sync
+# The session is released last: a new insertion must not take the log and its offset while this one still writes them.
+rm -f "$STAGE/runner.pid" "$STAGE/state"
 RUNNER
   chmod 0755 "$STAGE/run.sh"
 
   # 3) ctl: the remote control, run over ssh (on the session PATH as `ctl`).
   cat > "$STAGE/ctl.sh" <<'CTL'
 #!/bin/sh
-# ctl - control the Boot menu session on the SP-16 over ssh. The runner (/tmp/bootmenu/run.sh) does the work.
+# ctl - control the Boot menu session on the SP-16 or the DJS-1000 over ssh. The runner (/tmp/bootmenu/run.sh) does the work.
 STAGE=/tmp/bootmenu
 LOG=$(cat "$STAGE/log.path" 2>/dev/null)
 USB=$(cat "$STAGE/usb.path" 2>/dev/null)
+OFFICIAL_COMM=EP085_Main_R; [ -f "$STAGE/unit.sh" ] && . "$STAGE/unit.sh"
 
 die() { echo "ctl: $*" >&2; exit 1; }
 runner_alive() { p=$(cat "$STAGE/runner.pid" 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
@@ -674,7 +875,7 @@ case "${1:-help}" in
     if runner_alive; then echo "runner    pid $(cat "$STAGE/runner.pid"), state: $(cat "$STAGE/state" 2>/dev/null)"
     else echo "runner    not running"; fi
     p=$(cat "$STAGE/child.pid" 2>/dev/null); [ -n "$p" ] && echo "child     pid $p ($(cat /proc/$p/comm 2>/dev/null))"
-    s=$(pidof EP085_Main_R 2>/dev/null); echo "official app ${s:-not running}"
+    s=$(pidof "$OFFICIAL_COMM" 2>/dev/null); echo "official  ${UNIT_NAME:-?} $OFFICIAL_COMM ${s:-not running}"
     d=$(cat "$STAGE/dropbear.pid" 2>/dev/null); echo "ssh       ${d:+pid $d}${d:-not running}"
     echo "last      $(cat "$USB/bootmenu.last" 2>/dev/null)"
     echo "carrier   $(cat /sys/class/net/eth0/carrier 2>/dev/null || echo '?')"
@@ -720,9 +921,9 @@ CTL
   # 4) Detach the runner (new session, so udev tearing down this process cannot take it along): the menu starts now.
   echo "autoexec.sh: detaching runner"
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$LOG" 2>&1 &
+    setsid "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$STAGE/run.log" 2>&1 &
   else
-    nohup "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$LOG" 2>&1 &
+    nohup "$STAGE/run.sh" "$LOG" "$USB" </dev/null >>"$STAGE/run.log" 2>&1 &
   fi
 
   # 5) Copy the embedded apps out of the image while the menu is already up (the hook unmounts it when we return).

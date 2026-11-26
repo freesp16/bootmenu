@@ -56,6 +56,38 @@ tools/extract-upd.py --key aes256.key TORAIZSP16_1.63.3.UPD --name my163 --out /
 #    --encrypt: my163 encrypted with the key; --base OTHER.UPD: only the resources that differ from OTHER.UPD
 ```
 
+On a DJS-1000 the same applies to its official application, `EP113_Main_R`. The menu knows each unit's releases by
+their size, so a copy made for the other unit is listed with the reason it cannot start.
+
+## A mod of the official software
+
+Some projects change the official software without replacing it: a library loaded into the installed application
+when it starts. A folder app runs it with `exe=official`:
+
+```
+apps/mymod/
+  app.ini            exe=official, preload=libmymod.so (below)
+  libmymod.so
+```
+
+```
+name=My mod
+exe=official                  # the unit's installed official application
+preload=libmymod.so           # loaded first (LD_PRELOAD), copied to RAM before it starts
+needs_official=1.22           # optional: the row says it cannot start on another release (told by the file size)
+official_md5=0123...cdef      # optional: checked before it starts, for the exact build the library was written for
+env=MYMOD_SETTINGS=${STICK}/mymod/settings.txt    # optional, repeatable: ${STICK}, ${APP_DIR}
+```
+
+The application runs as the installed one does, in `/root/pdj` with the unit's own `/root/data` (`data=` names a
+stick folder instead). On the DJS-1000 it is started in the environment and with the signal settings the unit gave
+it at power-on, and the stick is announced to it again, as for the official software itself (see
+[usage.md](usage.md#the-djs-1000)). The row shows the installed release and the library's name. When the
+official application is missing, is another release, or the library is not on the stick, the row says so and does
+not start.
+
+`env=` lines work for any program, not only these.
+
 ## How it runs
 
 The menu exits before the program starts, so the program gets the screen (`/dev/fb0`, or X on `:0`), the panel
@@ -64,8 +96,12 @@ and the audio to itself, just as the official software has them. It runs as root
 - its working directory set to its own folder (`/root/pdj` for the official application);
 - `/root/gui` with its own screen resources laid over the unit's, when it has an `<id>-gui/` folder;
 - `/root/data` mapped to `<stick>/<id>-data/` for the program alone, so nothing lands in internal memory;
-- the `key=value` lines of `<stick>/<id>.conf` as environment variables `<ID>_<KEY>`;
-- `BOOTMENU_STICK`, `BOOTMENU_APP_DIR` and `BOOTMENU_APP_ID` set.
+- the `key=value` lines of `<stick>/<id>.conf` as environment variables `<ID>_<KEY>`, and its `env=` lines;
+- `BOOTMENU_STICK`, `BOOTMENU_APP_DIR`, `BOOTMENU_APP_ID` and `BOOTMENU_UNIT` (`sp16` or `djs1000`) set.
+
+A program written for both units reads `BOOTMENU_UNIT` to tell them apart. Their panels report the same buttons in
+different places of the frame (see [usage.md](usage.md#the-djs-1000)). On the DJS-1000 the panel holds the outputs
+muted until a program clears that request in the frames it sends.
 
 Programs from the stick run from a RAM disk of their own (the unit's `/tmp` is small), so they do not depend on the
 stick while they run. When it exits, the menu comes back.
@@ -83,6 +119,9 @@ run_from=ram           # ram (copied to /tmp first) or stick
 accent=#4f8cff
 hidden=1
 gui=my-resources       # files for /root/gui (default: <id>-gui/ when it exists; none = never)
+env=KEY=value          # an environment variable (repeatable), ${STICK} and ${APP_DIR} replaced
+exe=official           # folder apps: the installed official application (see above), with preload=,
+                       # needs_official= and official_md5=
 ```
 
 All keys are optional.

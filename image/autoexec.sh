@@ -1,5 +1,5 @@
 #!/bin/sh
-# autoexec.sh - the stub the SP-16's USB autoexec hook runs (as root, from the decrypted image, $1 = the stick).
+# autoexec.sh - the stub the USB autoexec hook of the SP-16 or the DJS-1000 runs (as root, from the decrypted image, $1 = the stick).
 # Deliberately trivial, so even an old shell runs its first line: it logs that the hook ran and how, then runs the
 # real launcher (launcher.sh) with every message, parse errors included, in bootmenu.log on the stick.
 L="${1:-/tmp}/bootmenu.log"
