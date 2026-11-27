@@ -6,6 +6,8 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-27
+
 ### Added
 - The DJS-1000: the same `autoexec.bin` runs on it, tells the unit by its installed official application and shows
   the model in the header. Its panel layout and POWER key are read, and its lamps are off while the menu is shown.
