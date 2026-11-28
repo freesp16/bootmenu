@@ -35,6 +35,9 @@ official_wait_ms=8000
 
 - **An app quits:** the menu comes back.
 - **An app fails at once:** the menu comes back and says so; details are in `bootmenu.log`.
+- **The stick is in at power-on:** the menu waits for the unit to start its official software (90 s, longer while
+  the unit's start-up scripts still run) and to take the panel, then stops it, so the two never draw over each other
+  or read the controls at the same time.
 - **The stick is pulled:** the app or the menu stops and the official software starts again. What happened then
   could not be written to the stick, so it is added to `bootmenu.log` the next time the stick goes in.
 - **The GPU cannot draw:** the menu is drawn by the CPU instead, a little slower to move but the same to use.
@@ -55,8 +58,6 @@ What differs on the DJS-1000:
   signal settings the unit gave it are read from `/proc`. When it starts again (BACK twice, or pulling the stick), it
   gets them back, and the stick is announced to it again. Started from the USB hook as it is, it would run in udev's
   and not see the stick.
-- **With the stick in at power-on**, the menu waits for the unit to start its official software (90 s at most) and
-  then stops it, so the two never draw over each other.
 - **The panel.** The menu turns every pad and button lamp off and keeps the outputs muted while it is shown. A
   program started from it clears that request itself once its audio runs. The link keeps running when the menu
   exits, as the official software expects it.

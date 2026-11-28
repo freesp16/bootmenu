@@ -184,26 +184,51 @@ announce_stick() {
   fi
 }
 
+# The unit's start-up scripts still run: rcS (the hook of a stick that is in at power-on runs inside its udevsettle),
+# rc.local, then apl_start, which starts the official application last.
+boot_running() { grep -q -E 'rc\.d/rcS|rc\.local|apl_start' /proc/[0-9]*/cmdline 2>/dev/null; }
+
+# The official application has the panel link open: it is past its start-up, and its own set-up of the link is done.
+official_has_panel() {
+  for p in $(official_pids); do
+    for fd in /proc/"$p"/fd/*; do
+      [ "$(readlink "$fd" 2>/dev/null)" = /dev/subucom_spi0.1 ] && return 0
+    done
+  done
+  return 1
+}
+
 # A stick that is in at power-on is mounted, and this image run, before the unit's start-up gets to the official
-# application. The menu would then find nothing to stop, and the application would start over it. So when it does
-# not run yet and the unit is still starting (apl_start runs, or it is up for less than 5 minutes),, the menu waits for it (90 s at most), then stops it as usual.
+# application (on both units). The menu would then find nothing to stop, and the application would start over it:
+# two programs drawing on the screen and setting up and reading the panel. So when it does not run yet and the unit
+# is still starting, the menu waits for it (90 s, longer while the start-up scripts still run, 300 s at most), and
+# for it to open the panel, then stops it as usual.
 wait_for_official() {
-  [ "$FAITHFUL_RESTART" = 1 ] || return 0 # seen on the DJS-1000, the SP-16 is left as it was
   official_running && return 0
-  up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  [ -x "$OFFICIAL_EXE" ] || return 0
   starting=""
-  [ "${up:-0}" -lt 300 ] && starting=1
-  grep -q apl_start /proc/[0-9]*/cmdline 2>/dev/null && starting=1
-  [ -d /opt/djsemu ] && starting=1
-  [ -n "$starting" ] && [ -x "$OFFICIAL_EXE" ] || return 0
+  boot_running && starting=1
+  if [ "$FAITHFUL_RESTART" = 1 ]; then # DJS-1000, as seen there: up for less than 5 minutes, or its emulator
+    up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+    [ "${up:-0}" -lt 300 ] && starting=1
+    [ -d /opt/djsemu ] && starting=1
+  fi
+  [ -n "$starting" ] || return 0
   echo "runner: the official application is not running yet (the unit is starting): waiting for it"
   i=0
-  while [ $i -lt 90 ] && ! official_running; do sleep 1; i=$((i+1)); [ -f "$STAGE/gone" ] && return 0; done
+  while ! official_running && { [ $i -lt 90 ] || { [ $i -lt 300 ] && boot_running; }; }; do
+    sleep 1; i=$((i+1)); [ -f "$STAGE/gone" ] && return 0
+  done
   if official_running; then
     echo "runner: it started after $i s"
+    j=0
+    while [ $j -lt 30 ] && official_running && ! official_has_panel; do
+      sleep 1; j=$((j+1)); [ -f "$STAGE/gone" ] && return 0
+    done
+    official_has_panel && echo "runner: it has the panel open after $j s more"
     sleep 2 # let it get to its signal handlers before it is asked to stop
   else
-    echo "runner: it did not start within 90 s"
+    echo "runner: it did not start within $i s"
   fi
 }
 
