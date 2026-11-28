@@ -6,6 +6,8 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-28
+
 ### Fixed
 - SP-16: with the stick in at power-on, the menu no longer starts before the official software. It waits for the
   unit to start it, as on the DJS-1000, then stops it; the official software no longer starts over the menu, with both
