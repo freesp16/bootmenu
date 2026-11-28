@@ -6,6 +6,12 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- SP-16: with the stick in at power-on, the menu no longer starts before the official software. It waits for the
+  unit to start it, as on the DJS-1000, then stops it; the official software no longer starts over the menu, with both
+  drawing on the screen and reading the buttons and encoders. On both units the menu also waits until the official
+  software has opened the panel, and for as long as the unit's start-up scripts still run (300 s at most).
+
 ## [1.2.0] - 2026-11-27
 
 ### Added
